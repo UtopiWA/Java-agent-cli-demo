@@ -1,0 +1,13 @@
+# Build and version-control metadata
+target/
+.git/
+.idea/
+
+# Binary files that code search should skip
+*.class
+*.jar
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
