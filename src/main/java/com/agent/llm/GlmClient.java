@@ -64,8 +64,7 @@ public final class GlmClient implements LLMClient {
         try (Response response = httpClient.newCall(request).execute()) {
             String responseBody = response.body() == null ? "" : response.body().string();
             if (!response.isSuccessful()) {
-                throw new IOException(
-                        "GLM HTTP " + response.code() + ": " + responseBody);
+                throw new GlmHttpException(response.code(), responseBody);
             }
             return parseResponse(responseBody);
         }

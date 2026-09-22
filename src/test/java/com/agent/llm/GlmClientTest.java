@@ -94,20 +94,30 @@ class GlmClientTest {
     }
 
     @Test
-    void shouldPreserveStatusAndBodyForHttpErrors() {
+    void shouldClassifyHttpErrors() {
+        assertHttpError(401, GlmHttpException.Kind.AUTHENTICATION, "鉴权失败");
+        assertHttpError(429, GlmHttpException.Kind.RATE_LIMIT, "请求受限");
+        assertHttpError(503, GlmHttpException.Kind.SERVER, "服务暂时异常");
+        assertHttpError(400, GlmHttpException.Kind.OTHER, "HTTP 请求失败");
+    }
+
+    private void assertHttpError(
+            int status, GlmHttpException.Kind expectedKind, String expectedMessage) {
         OkHttpClient httpClient = fakeHttpClient(
-                429,
-                "{\"error\":\"rate limited\"}",
+                status,
+                "{\"error\":\"test response\"}",
                 new AtomicReference<>(),
                 new AtomicReference<>());
         GlmClient client = new GlmClient(
                 "test-key", httpClient, "https://example.invalid/chat", mapper);
 
-        Exception error = assertThrows(Exception.class,
+        GlmHttpException error = assertThrows(GlmHttpException.class,
                 () -> client.chat(List.of(Message.user("hello")), List.of()));
 
-        assertTrue(error.getMessage().contains("GLM HTTP 429"));
-        assertTrue(error.getMessage().contains("rate limited"));
+        assertEquals(status, error.statusCode());
+        assertEquals(expectedKind, error.kind());
+        assertTrue(error.getMessage().contains(expectedMessage));
+        assertTrue(error.responseBody().contains("test response"));
     }
 
     private static OkHttpClient fakeHttpClient(

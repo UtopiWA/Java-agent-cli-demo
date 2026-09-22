@@ -2,10 +2,13 @@ package com.agent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import com.agent.llm.FakeLLMClient;
 import com.agent.llm.LLMResponse;
@@ -73,6 +76,29 @@ class AgentReActTest {
         List<Message> history = fake.requests().get(1);
         assertEquals("call_a", history.get(3).toolCallId());
         assertEquals("call_b", history.get(4).toolCallId());
+    }
+
+    @Test
+    void shouldCompleteListThenReadThenExplainWorkflow(@TempDir Path root) throws Exception {
+        Files.createDirectories(root.resolve("src"));
+        Files.writeString(root.resolve("src/Demo.java"), "class Demo {}");
+        FakeLLMClient fake = new FakeLLMClient(List.of(
+                new LLMResponse("", List.of(toolCall(
+                        "call_list", "list_files", "{\"path\":\"src\"}")), 1, 1),
+                new LLMResponse("", List.of(toolCall(
+                        "call_read", "read_file", "{\"path\":\"src/Demo.java\"}")), 1, 1),
+                new LLMResponse("Demo.java 定义了 Demo 类。", null, 1, 1)));
+
+        String answer = new Agent(fake, new ToolRegistry(root))
+                .run("列出 Java 文件，读取一个文件并解释职责");
+
+        assertEquals("Demo.java 定义了 Demo 类。", answer);
+        assertEquals(3, fake.requests().size());
+        List<Message> finalRequest = fake.requests().get(2);
+        assertEquals("call_list", finalRequest.get(3).toolCallId());
+        assertTrue(finalRequest.get(3).content().contains("src/Demo.java"));
+        assertEquals("call_read", finalRequest.get(5).toolCallId());
+        assertTrue(finalRequest.get(5).content().contains("class Demo"));
     }
 
     @Test

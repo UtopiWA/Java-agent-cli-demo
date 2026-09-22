@@ -22,8 +22,11 @@ public class Agent {
             2. read_file：读取文件内容；
             3. search_code：搜索代码。
 
+            所有工具路径都必须位于项目根目录内，优先使用相对路径。
             需要了解项目代码时，请调用工具。
+            对“列出—读取—解释”任务，应先列出文件，再读取相关文件后回答。
             获得工具结果后，再基于结果继续完成任务。
+            工具结果可能被截断；信息不足时请缩小范围或使用分页参数继续调用。
             请用中文回复用户。
             """;
 
@@ -70,7 +73,7 @@ public class Agent {
                     System.out.println("参数: " + call.arguments());
 
                     String result = registry.execute(call.name(), call.arguments());
-                    System.out.println("结果: " + truncate(result, 200));
+                    System.out.println("结果: " + truncate(result, 200)); // 工具调用的终端输出不超过200字符
                     history.add(Message.tool(call.id(), result));
                 }
                 continue;

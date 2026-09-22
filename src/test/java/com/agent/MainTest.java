@@ -7,11 +7,17 @@ import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+
+import com.agent.llm.FakeLLMClient;
+import com.agent.llm.LLMResponse;
+import com.agent.tool.ToolRegistry;
 
 class MainTest {
     @Test
@@ -56,6 +62,24 @@ class MainTest {
         assertEquals("environment-test-key",
                 Main.loadApiKey(envFile, Map.of("GLM_API_KEY", " environment-test-key ")));
         assertNull(Main.loadApiKey(envFile, Map.of()));
+    }
+
+    @Test
+    void shouldHandleClearCommandInAgentCli() throws Exception {
+        FakeLLMClient fake = new FakeLLMClient(List.of(
+                new LLMResponse("第一轮", null, 1, 1),
+                new LLMResponse("第二轮", null, 1, 1)));
+        Agent agent = new Agent(fake, new ToolRegistry());
+        StringWriter output = new StringWriter();
+
+        Main.runAgentCli(
+                new BufferedReader(new StringReader("问题一\nclear\n问题二\nexit\n")),
+                new PrintWriter(output, true),
+                agent);
+
+        assertTrue(output.toString().contains("历史已清空"));
+        assertEquals(2, fake.requests().get(1).size());
+        assertEquals("问题二", fake.requests().get(1).get(1).content());
     }
 
     private String runCli(String input, boolean upper) throws Exception {
