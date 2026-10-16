@@ -2,12 +2,17 @@ package com.agent.tool;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import com.agent.llm.LLMClient;
@@ -41,7 +46,20 @@ public class ToolRegistry {
             String type,
             String description,
             boolean required,
-            Long minimum) {
+            Integer minLength,
+            Long minimum,
+            Long maximum,
+            String itemType) {
+        private Param(
+                String name,
+                String type,
+                String description,
+                boolean required,
+                Long minimum) {
+            this(name, type, description, required,
+                    "string".equals(type) ? 1 : null,
+                    minimum, null, null);
+        }
     }
 
     /** 以当前工作目录作为唯一可访问的项目根目录。 */
@@ -53,6 +71,7 @@ public class ToolRegistry {
     public ToolRegistry(Path projectRoot) {
         this.projectRoot = canonicalRoot(projectRoot);
         registerFileTools();
+        registerMutationTools();
     }
 
     /** 按注册顺序生成发送给模型的 Tool Calling 定义。 */
@@ -72,14 +91,18 @@ public class ToolRegistry {
 
         try {
             JsonNode node = mapper.readTree(argumentsJson == null ? "{}" : argumentsJson);
-            if (!node.isObject()) {
+            if (node == null || !node.isObject()) {
                 return "执行工具失败: arguments 必须是 JSON 对象";
             }
-
-            Map<String, String> args = new LinkedHashMap<>();
-            node.fields().forEachRemaining(entry ->
-                    args.put(entry.getKey(), entry.getValue().asText()));
-            return limitResult(tool.handler().execute(args));
+            ObjectNode arguments = (ObjectNode) node;
+            validateArguments(arguments, tool.parameters());
+            Map<String, String> adaptedArguments = new LinkedHashMap<>();
+            arguments.fields().forEachRemaining(entry -> adaptedArguments.put(
+                    entry.getKey(),
+                    entry.getValue().isContainerNode()
+                            ? entry.getValue().toString()
+                            : entry.getValue().asText()));
+            return limitResult(tool.handler().execute(adaptedArguments));
         } catch (Exception e) {
             return "执行工具失败: " + errorMessage(e);
         }
@@ -97,17 +120,86 @@ public class ToolRegistry {
             ObjectNode property = properties.putObject(param.name());
             property.put("type", param.type());
             property.put("description", param.description());
-            if ("string".equals(param.type())) {
-                property.put("minLength", 1);
+            if (param.minLength() != null) {
+                property.put("minLength", param.minLength());
             }
             if (param.minimum() != null) {
                 property.put("minimum", param.minimum());
+            }
+            if (param.maximum() != null) {
+                property.put("maximum", param.maximum());
+            }
+            if (param.itemType() != null) {
+                property.putObject("items").put("type", param.itemType());
             }
             if (param.required()) {
                 required.add(param.name());
             }
         }
         return root;
+    }
+
+    /** 在真实执行前按已发送给模型的 JSON Schema 做同等的基础校验。 */
+    private static void validateArguments(ObjectNode arguments, JsonNode schema) {
+        JsonNode properties = schema.path("properties");
+        Set<String> allowed = new HashSet<>();
+        properties.fieldNames().forEachRemaining(allowed::add);
+        arguments.fieldNames().forEachRemaining(name -> {
+            if (!allowed.contains(name)) {
+                throw new IllegalArgumentException("未知参数: " + name);
+            }
+        });
+
+        for (JsonNode required : schema.path("required")) {
+            String name = required.asText();
+            if (!arguments.has(name) || arguments.get(name).isNull()) {
+                throw new IllegalArgumentException("缺少必填参数: " + name);
+            }
+        }
+
+        arguments.fields().forEachRemaining(entry ->
+                validateValue(entry.getKey(), entry.getValue(), properties.path(entry.getKey())));
+    }
+
+    private static void validateValue(String name, JsonNode value, JsonNode definition) {
+        String type = definition.path("type").asText();
+        boolean valid = switch (type) {
+            case "string" -> value.isTextual();
+            case "integer" -> value.isIntegralNumber();
+            case "boolean" -> value.isBoolean();
+            case "array" -> value.isArray();
+            default -> false;
+        };
+        if (!valid) {
+            throw new IllegalArgumentException("参数 " + name + " 类型必须为 " + type);
+        }
+        if (value.isIntegralNumber() && !value.canConvertToLong()) {
+            throw new IllegalArgumentException("参数 " + name + " 超出整数范围");
+        }
+
+        if (value.isTextual()
+                && value.textValue().length() < definition.path("minLength").asInt(0)) {
+            throw new IllegalArgumentException("参数 " + name + " 不能为空");
+        }
+        if (value.isIntegralNumber()) {
+            long number = value.longValue();
+            if (definition.has("minimum") && number < definition.path("minimum").asLong()) {
+                throw new IllegalArgumentException(
+                        "参数 " + name + " 不能小于 " + definition.path("minimum").asLong());
+            }
+            if (definition.has("maximum") && number > definition.path("maximum").asLong()) {
+                throw new IllegalArgumentException(
+                        "参数 " + name + " 不能大于 " + definition.path("maximum").asLong());
+            }
+        }
+        if (value.isArray()) {
+            String itemType = definition.path("items").path("type").asText();
+            for (JsonNode item : value) {
+                if ("string".equals(itemType) && !item.isTextual()) {
+                    throw new IllegalArgumentException("参数 " + name + " 的元素必须为 string");
+                }
+            }
+        }
     }
 
     /** 只做协议适配，实际列举、读取和搜索仍由 Lab02 的实现完成。 */
@@ -124,7 +216,7 @@ public class ToolRegistry {
                         new Param("max_depth", "integer", "最大递归深度，0 表示仅根节点", false, 0L)),
                 args -> {
                     try {
-                        Path path = resolveProjectPath(requiredArg(args, "path"));
+                        Path path = resolveProjectPath(requiredText(args, "path"));
                         int maxDepth = optionalInt(args, "max_depth", Integer.MAX_VALUE, 0);
                         return "文件列表:\n" + String.join("\n",
                                 lister.listFiles(path, maxDepth).stream()
@@ -146,7 +238,7 @@ public class ToolRegistry {
                         new Param("limit", "integer", "最多读取多少行，默认读取至文件末尾", false, 1L)),
                 args -> {
                     try {
-                        Path path = resolveProjectPath(requiredArg(args, "path"));
+                        Path path = resolveProjectPath(requiredText(args, "path"));
                         if (isProtectedEnvFile(path)) {
                             return "读取文件失败: 拒绝访问敏感配置文件";
                         }
@@ -170,8 +262,8 @@ public class ToolRegistry {
                         new Param("regex", "boolean", "是否把 keyword 作为正则表达式，默认 false", false, null)),
                 args -> {
                     try {
-                        String keyword = requiredArg(args, "keyword");
-                        Path path = resolveProjectPath(requiredArg(args, "path"));
+                        String keyword = requiredText(args, "keyword");
+                        Path path = resolveProjectPath(requiredText(args, "path"));
                         boolean regex = optionalBoolean(args, "regex", false);
                         List<SearchCodeTool.Match> matches = (regex
                                 ? searcher.searchCode(Pattern.compile(keyword), path)
@@ -188,6 +280,64 @@ public class ToolRegistry {
                         return result.toString();
                     } catch (Exception e) {
                         return "搜索失败: " + errorMessage(e);
+                    }
+                }));
+    }
+
+    /** 注册能够改变项目状态的工具，并在适配层统一施加路径和参数边界。 */
+    private void registerMutationTools() {
+        WriteFileTool writer = new WriteFileTool();
+        ExecuteCommandTool commandExecutor = new ExecuteCommandTool();
+
+        tools.put("write_file", new ToolEntry(
+                "write_file",
+                "以 UTF-8 新建或完整覆盖项目内的文本文件，父目录不存在时自动创建",
+                createParameters(
+                        new Param("path", "string", "项目根目录内的目标文件路径", true, null),
+                        new Param("content", "string", "要写入的完整文件内容", true,
+                                0, null, null, null)),
+                args -> {
+                    try {
+                        Path path = resolveWritableProjectPath(requiredText(args, "path"));
+                        if (isProtectedPath(path)) {
+                            return "写入文件失败: 拒绝修改敏感路径";
+                        }
+                        WriteFileTool.WriteResult result = writer.writeFile(
+                                path, requiredTextAllowEmpty(args, "content"));
+                        return "写入文件成功: " + projectRelativePath(path)
+                                + "\n操作: " + (result.created() ? "新建" : "覆盖")
+                                + "\n写入字节数: " + result.bytesWritten();
+                    } catch (Exception e) {
+                        return "写入文件失败: " + errorMessage(e);
+                    }
+                }));
+
+        tools.put("execute_command", new ToolEntry(
+                "execute_command",
+                "在项目内参数化执行受允许列表约束的开发命令，不接受 Shell 命令字符串",
+                createParameters(
+                        new Param("program", "string", "可执行程序名，例如 java、javac 或 mvn", true, null),
+                        new Param("arguments", "array", "按顺序传递给程序的字符串参数", false,
+                                null, null, null, "string"),
+                        new Param("working_directory", "string", "项目根目录内的工作目录，默认 .", false, null),
+                        new Param("timeout_seconds", "integer", "超时秒数，默认 30，范围 1 到 120", false,
+                                null, 1L, 120L, null)),
+                args -> {
+                    try {
+                        String workingDirectory = optionalText(args, "working_directory", ".");
+                        Path directory = resolveProjectPath(workingDirectory);
+                        if (!Files.isDirectory(directory)) {
+                            return "执行命令失败: 工作目录不是目录";
+                        }
+                        int timeout = optionalInt(args, "timeout_seconds", 30, 1);
+                        ExecuteCommandTool.CommandResult result = commandExecutor.execute(
+                                directory,
+                                requiredText(args, "program"),
+                                optionalStringList(args, "arguments"),
+                                Duration.ofSeconds(timeout));
+                        return formatCommandResult(result);
+                    } catch (Exception e) {
+                        return "执行命令失败: " + errorMessage(e);
                     }
                 }));
     }
@@ -209,6 +359,32 @@ public class ToolRegistry {
         return realPath;
     }
 
+    /** 为可能尚不存在的写入目标验证词法边界和每个已存在路径分量。 */
+    private Path resolveWritableProjectPath(String value) throws IOException {
+        Path requested = Path.of(value);
+        Path candidate = requested.isAbsolute()
+                ? requested.toAbsolutePath().normalize()
+                : projectRoot.resolve(requested).normalize();
+        if (!candidate.startsWith(projectRoot) || candidate.equals(projectRoot)) {
+            throw new SecurityException("路径超出项目根目录或指向根目录: " + value);
+        }
+
+        Path current = projectRoot;
+        for (Path part : projectRoot.relativize(candidate)) {
+            current = current.resolve(part);
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(current)) {
+                    throw new SecurityException("路径包含符号链接: " + value);
+                }
+                Path realPath = current.toRealPath();
+                if (!realPath.startsWith(projectRoot)) {
+                    throw new SecurityException("路径逃逸项目根目录: " + value);
+                }
+            }
+        }
+        return candidate;
+    }
+
     /** 工具间统一交换项目根目录相对路径，避免后续 read_file 误解子目录结果。 */
     private String projectRelativePath(Path path) {
         return projectRoot.relativize(path).toString().replace('\\', '/');
@@ -227,12 +403,26 @@ public class ToolRegistry {
         }
     }
 
-    private static String requiredArg(Map<String, String> args, String name) {
-        String value = args.get(name);
-        if (value == null || value.isBlank()) {
+    private static String requiredText(Map<String, String> args, String name) {
+        String value = requiredTextAllowEmpty(args, name);
+        if (value.isBlank()) {
             throw new IllegalArgumentException("缺少必填参数: " + name);
         }
         return value;
+    }
+
+    private static String requiredTextAllowEmpty(Map<String, String> args, String name) {
+        String value = args.get(name);
+        if (value == null) {
+            throw new IllegalArgumentException("缺少必填参数: " + name);
+        }
+        return value;
+    }
+
+    private static String optionalText(
+            Map<String, String> args, String name, String defaultValue) {
+        String value = args.get(name);
+        return value == null ? defaultValue : value;
     }
 
     private static int optionalInt(
@@ -247,30 +437,32 @@ public class ToolRegistry {
     private static long optionalLong(
             Map<String, String> args, String name, long defaultValue, long minimum) {
         String raw = args.get(name);
-        if (raw == null || raw.isBlank()) {
+        if (raw == null) {
             return defaultValue;
         }
-        try {
-            long value = Long.parseLong(raw);
-            if (value < minimum) {
-                throw new IllegalArgumentException("参数 " + name + " 不能小于 " + minimum);
-            }
-            return value;
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("参数 " + name + " 必须是整数");
+        long value = Long.parseLong(raw);
+        if (value < minimum) {
+            throw new IllegalArgumentException("参数 " + name + " 不能小于 " + minimum);
         }
+        return value;
     }
 
     private static boolean optionalBoolean(
             Map<String, String> args, String name, boolean defaultValue) {
         String raw = args.get(name);
-        if (raw == null || raw.isBlank()) {
-            return defaultValue;
+        return raw == null ? defaultValue : Boolean.parseBoolean(raw);
+    }
+
+    private List<String> optionalStringList(Map<String, String> args, String name)
+            throws IOException {
+        String raw = args.get(name);
+        if (raw == null) {
+            return List.of();
         }
-        if (!"true".equalsIgnoreCase(raw) && !"false".equalsIgnoreCase(raw)) {
-            throw new IllegalArgumentException("参数 " + name + " 必须是布尔值");
-        }
-        return Boolean.parseBoolean(raw);
+        JsonNode values = mapper.readTree(raw);
+        List<String> result = new ArrayList<>();
+        values.forEach(value -> result.add(value.textValue()));
+        return List.copyOf(result);
     }
 
     /** 截断写入模型上下文的 Observation，并明确标记原始长度。 */
@@ -290,6 +482,25 @@ public class ToolRegistry {
         }
         String normalizedName = fileName.toString().toLowerCase(Locale.ROOT);
         return normalizedName.equals(".env") || normalizedName.startsWith(".env.");
+    }
+
+    /** 写操作额外保护版本控制元数据以及任意层级的密钥配置路径。 */
+    private static boolean isProtectedPath(Path path) {
+        for (Path part : path.normalize()) {
+            String name = part.toString().toLowerCase(Locale.ROOT);
+            if (name.equals(".git") || name.equals(".env") || name.startsWith(".env.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String formatCommandResult(ExecuteCommandTool.CommandResult result) {
+        return "命令执行结果:"
+                + "\n退出码: " + result.exitCode()
+                + "\n超时: " + result.timedOut()
+                + "\n标准输出:\n" + result.standardOutput()
+                + "\n标准错误:\n" + result.standardError();
     }
 
     private static String errorMessage(Exception exception) {

@@ -18,12 +18,14 @@ class ToolRegistryTest {
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Test
-    void shouldExposeThreeDetailedToolSchemas() {
+    void shouldExposeFiveDetailedToolSchemas() {
         ToolRegistry registry = new ToolRegistry();
 
         List<LLMClient.ToolDef> definitions = registry.getToolDefinitions();
 
-        assertEquals(List.of("list_files", "read_file", "search_code"),
+        assertEquals(List.of(
+                        "list_files", "read_file", "search_code",
+                        "write_file", "execute_command"),
                 definitions.stream().map(LLMClient.ToolDef::name).toList());
         LLMClient.ToolDef list = definitions.get(0);
         assertFalse(list.parameters().path("additionalProperties").asBoolean(true));
@@ -41,6 +43,18 @@ class ToolRegistryTest {
         assertEquals("boolean", search.parameters()
                 .path("properties").path("regex").path("type").asText());
         assertEquals(2, search.parameters().path("required").size());
+
+        LLMClient.ToolDef write = definitions.get(3);
+        assertTrue(write.parameters().path("properties").has("content"));
+        assertEquals(0, write.parameters().path("properties")
+                .path("content").path("minLength").asInt(-1));
+        LLMClient.ToolDef execute = definitions.get(4);
+        assertEquals("array", execute.parameters().path("properties")
+                .path("arguments").path("type").asText());
+        assertEquals("string", execute.parameters().path("properties")
+                .path("arguments").path("items").path("type").asText());
+        assertEquals(120, execute.parameters().path("properties")
+                .path("timeout_seconds").path("maximum").asInt());
     }
 
     @Test
@@ -62,8 +76,79 @@ class ToolRegistryTest {
         assertEquals("未知工具: no_such_tool", registry.execute("no_such_tool", "{}"));
         assertTrue(registry.execute("read_file", "not-json")
                 .startsWith("执行工具失败:"));
+        assertTrue(registry.execute("read_file", "")
+                .contains("arguments 必须是 JSON 对象"));
         assertTrue(registry.execute("read_file", "{}")
                 .contains("缺少必填参数: path"));
+        assertTrue(registry.execute("read_file", "{\"path\":\"README.md\",\"extra\":1}")
+                .contains("未知参数: extra"));
+        assertTrue(registry.execute("list_files", "{\"path\":\".\",\"max_depth\":\"1\"}")
+                .contains("类型必须为 integer"));
+    }
+
+    @Test
+    void shouldCreateAndOverwriteFileWithinProject(@TempDir Path root) throws Exception {
+        ToolRegistry registry = new ToolRegistry(root);
+        String create = registry.execute("write_file", mapper.createObjectNode()
+                .put("path", "src/Generated.java")
+                .put("content", "class Generated {}")
+                .toString());
+        String overwrite = registry.execute("write_file", mapper.createObjectNode()
+                .put("path", "src/Generated.java")
+                .put("content", "class Generated { int value; }")
+                .toString());
+
+        assertTrue(create.contains("写入文件成功"));
+        assertTrue(create.contains("操作: 新建"));
+        assertTrue(overwrite.contains("操作: 覆盖"));
+        assertEquals("class Generated { int value; }",
+                Files.readString(root.resolve("src/Generated.java")));
+    }
+
+    @Test
+    void shouldRejectUnsafeWriteTargets(@TempDir Path parent) throws Exception {
+        Path root = Files.createDirectory(parent.resolve("project"));
+        ToolRegistry registry = new ToolRegistry(root);
+
+        String traversal = registry.execute("write_file", mapper.createObjectNode()
+                .put("path", "../outside.txt")
+                .put("content", "outside")
+                .toString());
+        String environment = registry.execute("write_file", mapper.createObjectNode()
+                .put("path", ".env.local")
+                .put("content", "secret")
+                .toString());
+        String gitMetadata = registry.execute("write_file", mapper.createObjectNode()
+                .put("path", ".git/config")
+                .put("content", "unsafe")
+                .toString());
+
+        assertTrue(traversal.contains("路径超出项目根目录"));
+        assertTrue(environment.contains("拒绝修改敏感路径"));
+        assertTrue(gitMetadata.contains("拒绝修改敏感路径"));
+        assertFalse(Files.exists(parent.resolve("outside.txt")));
+        assertFalse(Files.exists(root.resolve(".env.local")));
+    }
+
+    @Test
+    void shouldExecuteAllowedCommandAndRejectUnsafeCommandOptions(@TempDir Path root) {
+        ToolRegistry registry = new ToolRegistry(root);
+        var command = mapper.createObjectNode();
+        command.put("program", "java");
+        command.putArray("arguments").add("-version");
+        String javaVersion = registry.execute("execute_command", command.toString());
+        String denied = registry.execute("execute_command", mapper.createObjectNode()
+                .put("program", "powershell")
+                .toString());
+        String outsideDirectory = registry.execute("execute_command", mapper.createObjectNode()
+                .put("program", "java")
+                .put("working_directory", "..")
+                .toString());
+
+        assertTrue(javaVersion.contains("退出码: 0"));
+        assertTrue(javaVersion.contains("标准错误:"));
+        assertTrue(denied.contains("不允许执行程序"));
+        assertTrue(outsideDirectory.contains("路径超出项目根目录"));
     }
 
     @Test

@@ -15,6 +15,7 @@ import com.agent.llm.LLMResponse;
 import com.agent.llm.Message;
 import com.agent.llm.ToolCall;
 import com.agent.tool.ToolRegistry;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /** 离线验证 ReAct 分支、历史顺序、调用 ID 和循环上限。 */
 class AgentReActTest {
@@ -106,7 +107,8 @@ class AgentReActTest {
         List<LLMResponse> responses = new ArrayList<>();
         for (int index = 0; index < Agent.MAX_ITERATIONS; index++) {
             responses.add(new LLMResponse("", List.of(toolCall(
-                    "call_" + index, "no_such_tool", "{}")), 1, 1));
+                    "call_" + index, "no_such_tool",
+                    "{\"attempt\":" + index + "}")), 1, 1));
         }
         FakeLLMClient fake = new FakeLLMClient(responses);
 
@@ -131,6 +133,75 @@ class AgentReActTest {
         assertEquals(2, secondConversation.size());
         assertEquals("system", secondConversation.get(0).role());
         assertEquals("问题二", secondConversation.get(1).content());
+    }
+
+    @Test
+    void shouldRejectBlankOrDuplicateToolCallIds() {
+        FakeLLMClient blankId = new FakeLLMClient(List.of(
+                new LLMResponse("", List.of(toolCall("", "list_files", "{}")), 1, 1)));
+        FakeLLMClient duplicateId = new FakeLLMClient(List.of(
+                new LLMResponse("", List.of(
+                        toolCall("same", "list_files", "{\"path\":\".\"}"),
+                        toolCall("same", "read_file", "{\"path\":\"README.md\"}")), 1, 1)));
+
+        String blankAnswer = new Agent(blankId, new ToolRegistry()).run("blank");
+        String duplicateAnswer = new Agent(duplicateId, new ToolRegistry()).run("duplicate");
+
+        assertTrue(blankAnswer.contains("工具调用 ID 不能为空"));
+        assertTrue(duplicateAnswer.contains("工具调用 ID 重复"));
+    }
+
+    @Test
+    void shouldStopOnThirdCanonicalRepeatedCall() {
+        FakeLLMClient fake = new FakeLLMClient(List.of(
+                new LLMResponse("", List.of(toolCall(
+                        "repeat_1", "no_such_tool", "{\"a\":1,\"b\":2}")), 1, 1),
+                new LLMResponse("", List.of(toolCall(
+                        "repeat_2", "no_such_tool", "{\"b\":2,\"a\":1}")), 1, 1),
+                new LLMResponse("", List.of(toolCall(
+                        "repeat_3", "no_such_tool", "{\"a\":1,\"b\":2}")), 1, 1)));
+
+        String answer = new Agent(fake, new ToolRegistry()).run("重复调用");
+
+        assertTrue(answer.contains("连续 3 次相同工具调用"));
+        assertEquals(3, fake.requests().size());
+    }
+
+    @Test
+    void shouldCompleteReadWriteExecuteAndAnswerWorkflow(@TempDir Path root) throws Exception {
+        Files.writeString(root.resolve("task.txt"), "请生成一个输出 done 的 Java 程序");
+        ObjectMapper mapper = new ObjectMapper();
+        String readArgs = mapper.createObjectNode()
+                .put("path", "task.txt").toString();
+        String source = "class Generated { public static void main(String[] args) { "
+                + "System.out.print(\"done\"); } }";
+        String writeArgs = mapper.createObjectNode()
+                .put("path", "Generated.java")
+                .put("content", source)
+                .toString();
+        var commandArgs = mapper.createObjectNode();
+        commandArgs.put("program", "java");
+        commandArgs.putArray("arguments").add("Generated.java");
+        commandArgs.put("timeout_seconds", 20);
+
+        FakeLLMClient fake = new FakeLLMClient(List.of(
+                new LLMResponse("", List.of(toolCall(
+                        "call_read", "read_file", readArgs)), 1, 1),
+                new LLMResponse("", List.of(toolCall(
+                        "call_write", "write_file", writeArgs)), 1, 1),
+                new LLMResponse("", List.of(toolCall(
+                        "call_execute", "execute_command", commandArgs.toString())), 1, 1),
+                new LLMResponse("已生成并验证，程序输出 done。", null, 1, 1)));
+
+        String answer = new Agent(fake, new ToolRegistry(root)).run("完成 task.txt 中的任务");
+
+        assertEquals("已生成并验证，程序输出 done。", answer);
+        assertEquals(source, Files.readString(root.resolve("Generated.java")));
+        List<Message> finalRequest = fake.requests().get(3);
+        assertTrue(finalRequest.get(3).content().contains("请生成一个输出 done"));
+        assertTrue(finalRequest.get(5).content().contains("写入文件成功"));
+        assertTrue(finalRequest.get(7).content().contains("退出码: 0"));
+        assertTrue(finalRequest.get(7).content().contains("done"));
     }
 
     private static ToolCall toolCall(String id, String name, String arguments) {

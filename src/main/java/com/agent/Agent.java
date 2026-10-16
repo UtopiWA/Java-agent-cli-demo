@@ -15,16 +15,21 @@ import com.agent.tool.ToolRegistry;
 public class Agent {
     static final int MAX_ITERATIONS = 10;
     private static final String SYSTEM_PROMPT = """
-            你是一个 Java 编程助手 Agent，可以读取和搜索用户的项目代码。
+            你是一个 Java 编程助手 Agent，可以读取、修改和验证用户的项目代码。
 
             可用工具：
             1. list_files：列出目录下的文件；
             2. read_file：读取文件内容；
-            3. search_code：搜索代码。
+            3. search_code：搜索代码；
+            4. write_file：新建或完整覆盖 UTF-8 文本文件；
+            5. execute_command：在项目内执行受控的开发命令。
 
             所有工具路径都必须位于项目根目录内，优先使用相对路径。
             需要了解项目代码时，请调用工具。
             对“列出—读取—解释”任务，应先列出文件，再读取相关文件后回答。
+            修改代码前先读取相关文件；修改后执行最小必要的构建或测试，并根据真实结果答复。
+            不要尝试读取或修改 .env、.git 等敏感路径，也不要请求危险命令。
+            避免用相同参数反复调用同一工具；失败时应分析 Observation 后调整方案。
             获得工具结果后，再基于结果继续完成任务。
             工具结果可能被截断；信息不足时请缩小范围或使用分页参数继续调用。
             请用中文回复用户。
@@ -51,6 +56,7 @@ public class Agent {
     public String run(String userInput) {
         ensureReactConfigured();
         history.add(Message.user(Objects.requireNonNull(userInput, "userInput")));
+        SafetyGuard safetyGuard = new SafetyGuard();
 
         for (int round = 1; round <= MAX_ITERATIONS; round++) {
             System.out.println("\n思考中……第 " + round + " 轮");
@@ -66,9 +72,29 @@ public class Agent {
                     response.promptTokens(), response.completionTokens());
 
             if (response.hasToolCalls()) {
+                String invalidCall = safetyGuard.validateCalls(response.toolCalls());
+                if (invalidCall != null) {
+                    return "工具调用被安全守卫拒绝: " + invalidCall;
+                }
+
                 // 先保存模型的完整调用意图，再按顺序回传每个调用的 Observation
                 history.add(Message.assistant(response.content(), response.toolCalls()));
-                for (ToolCall call : response.toolCalls()) {
+                for (int index = 0; index < response.toolCalls().size(); index++) {
+                    ToolCall call = response.toolCalls().get(index);
+                    String repeatedCall = safetyGuard.checkRepeatedCall(call);
+                    if (repeatedCall != null) {
+                        String refusal = "工具调用被安全守卫拒绝: " + repeatedCall;
+                        history.add(Message.tool(call.id(), refusal));
+                        // 已记录的 assistant 消息必须为每个 Tool Call 配对一条 tool 消息。
+                        for (int remaining = index + 1;
+                                remaining < response.toolCalls().size(); remaining++) {
+                            history.add(Message.tool(
+                                    response.toolCalls().get(remaining).id(),
+                                    "工具调用未执行: 本轮已被安全守卫终止"));
+                        }
+                        return refusal;
+                    }
+
                     System.out.println("执行工具: " + call.name());
                     System.out.println("参数: " + call.arguments());
 
