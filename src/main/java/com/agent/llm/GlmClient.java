@@ -53,6 +53,20 @@ public final class GlmClient implements LLMClient {
     @Override
     public LLMResponse chat(List<Message> messages, List<ToolDef> tools) throws IOException {
         ObjectNode requestJson = buildRequest(messages, tools);
+        return execute(requestJson);
+    }
+
+    /** GLM-5.3-Flash 强制思考；标题任务使用 low 以避免默认 max 推理导致超时降级。 */
+    @Override
+    public LLMResponse chatForTitle(List<Message> messages) throws IOException {
+        ObjectNode requestJson = buildRequest(messages, List.of());
+        requestJson.put("reasoning_effort", "low");
+        requestJson.put("max_tokens", 1024);
+        requestJson.put("stream", false);
+        return execute(requestJson);
+    }
+
+    private LLMResponse execute(ObjectNode requestJson) throws IOException {
         RequestBody body = RequestBody.create(requestJson.toString(), JSON);
         Request request = new Request.Builder()
                 .url(apiUrl)
@@ -127,9 +141,7 @@ public final class GlmClient implements LLMClient {
         }
 
         JsonNode message = choices.get(0).path("message");
-        JsonNode contentNode = message.path("content");
-        String content = contentNode.isMissingNode() || contentNode.isNull()
-                ? "" : contentNode.asText("");
+        String content = parseContent(message.path("content"));
 
         List<ToolCall> toolCalls = parseToolCalls(message.path("tool_calls"));
         JsonNode usage = root.path("usage");
@@ -138,6 +150,28 @@ public final class GlmClient implements LLMClient {
                 toolCalls,
                 usage.path("prompt_tokens").asInt(0),
                 usage.path("completion_tokens").asInt(0));
+    }
+
+    /** 同时兼容字符串内容和 OpenAI 风格的文本内容块数组。 */
+    private static String parseContent(JsonNode contentNode) {
+        if (contentNode.isMissingNode() || contentNode.isNull()) {
+            return "";
+        }
+        if (contentNode.isTextual()) {
+            return contentNode.asText();
+        }
+        if (!contentNode.isArray()) {
+            return contentNode.path("text").asText("");
+        }
+        StringBuilder content = new StringBuilder();
+        for (JsonNode block : contentNode) {
+            if (block.isTextual()) {
+                content.append(block.asText());
+            } else {
+                content.append(block.path("text").asText(""));
+            }
+        }
+        return content.toString();
     }
 
     private static List<ToolCall> parseToolCalls(JsonNode callsNode) {

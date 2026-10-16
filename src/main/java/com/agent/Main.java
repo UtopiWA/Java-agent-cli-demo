@@ -9,6 +9,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
+import com.agent.history.ChatHistoryStore;
+import com.agent.history.HistoryContextBuilder;
+import com.agent.history.HistorySanitizer;
+import com.agent.history.SessionManager;
+import com.agent.history.TitleGenerator;
 import com.agent.llm.GlmClient;
 import com.agent.tool.ToolRegistry;
 
@@ -31,8 +36,17 @@ public class Main {
             return;
         }
 
-        Agent agent = new Agent(new GlmClient(apiKey), new ToolRegistry());
-        runAgentCli(reader, writer, agent);
+        GlmClient client = new GlmClient(apiKey);
+        HistorySanitizer sanitizer = new HistorySanitizer();
+        HistoryContextBuilder contextBuilder = new HistoryContextBuilder();
+        Agent agent = new Agent(client, new ToolRegistry(), contextBuilder);
+        SessionManager sessions = new SessionManager(
+                agent,
+                new ChatHistoryStore(Path.of(".")),
+                sanitizer,
+                contextBuilder,
+                new TitleGenerator(client, sanitizer));
+        runAgentCli(reader, writer, sessions);
     }
 
     /** 保留 Lab01 的逐行输入模式，供原有测试与 --upper 参数继续使用。 */
@@ -77,6 +91,71 @@ public class Main {
 
             writer.println();
             writer.println("Agent：" + agent.run(input));
+            writer.println();
+        }
+        writer.println("再见！");
+    }
+
+    /** 运行带持久化会话管理的 CLI，并在本地拦截历史相关命令。 */
+    static void runAgentCli(
+            BufferedReader reader, PrintWriter writer, SessionManager sessions) throws IOException {
+        writer.println("输入问题；history 查看当前会话；sessions 列出历史；"
+                + "load <id> 加载；delete <id> 删除；clear 新建会话；exit/quit 退出。");
+        writer.println();
+
+        while (true) {
+            writer.print("你：");
+            writer.flush();
+            String line = reader.readLine();
+            if (line == null) {
+                break;
+            }
+            String input = line.trim();
+            if (input.isEmpty()) {
+                continue;
+            }
+            if ("exit".equalsIgnoreCase(input) || "quit".equalsIgnoreCase(input)) {
+                break;
+            }
+            if ("clear".equalsIgnoreCase(input)) {
+                sessions.clear();
+                writer.println("已开始新会话。");
+                writer.println();
+                continue;
+            }
+            if ("history".equalsIgnoreCase(input)) {
+                writer.println(sessions.history());
+                writer.println();
+                continue;
+            }
+            if ("sessions".equalsIgnoreCase(input)) {
+                writer.println(sessions.sessions());
+                writer.println();
+                continue;
+            }
+            if (input.regionMatches(true, 0, "load ", 0, 5)) {
+                writer.println(sessions.load(input.substring(5).trim()));
+                writer.println();
+                continue;
+            }
+            if ("load".equalsIgnoreCase(input)) {
+                writer.println("用法: load <id>");
+                writer.println();
+                continue;
+            }
+            if (input.regionMatches(true, 0, "delete ", 0, 7)) {
+                writer.println(sessions.delete(input.substring(7).trim()));
+                writer.println();
+                continue;
+            }
+            if ("delete".equalsIgnoreCase(input)) {
+                writer.println("用法: delete <id>");
+                writer.println();
+                continue;
+            }
+
+            writer.println();
+            writer.println("Agent：" + sessions.runTurn(input));
             writer.println();
         }
         writer.println("再见！");

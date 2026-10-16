@@ -3,6 +3,7 @@ target/
 .git/
 .idea/
 .env
+.agent/
 
 # Binary files that code search should skip
 *.class

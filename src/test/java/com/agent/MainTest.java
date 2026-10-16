@@ -15,6 +15,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import com.agent.history.ChatHistoryStore;
+import com.agent.history.HistoryContextBuilder;
+import com.agent.history.HistorySanitizer;
+import com.agent.history.SessionManager;
+import com.agent.history.TitleGenerator;
 import com.agent.llm.FakeLLMClient;
 import com.agent.llm.LLMResponse;
 import com.agent.tool.ToolRegistry;
@@ -80,6 +85,29 @@ class MainTest {
         assertTrue(output.toString().contains("历史已清空"));
         assertEquals(2, fake.requests().get(1).size());
         assertEquals("问题二", fake.requests().get(1).get(1).content());
+    }
+
+    @Test
+    void shouldDeleteSessionFromPersistentCli(@TempDir Path root) throws Exception {
+        FakeLLMClient fake = new FakeLLMClient(List.of(
+                new LLMResponse("已完成", null, 1, 1),
+                new LLMResponse("模型标题", null, 1, 1)));
+        HistorySanitizer sanitizer = new HistorySanitizer();
+        HistoryContextBuilder context = new HistoryContextBuilder();
+        Agent agent = new Agent(fake, new ToolRegistry(), context);
+        SessionManager sessions = new SessionManager(agent, new ChatHistoryStore(root),
+                sanitizer, context, new TitleGenerator(fake, sanitizer));
+        String id = sessions.currentSession().id();
+        StringWriter output = new StringWriter();
+
+        Main.runAgentCli(
+                new BufferedReader(new StringReader("保存一轮\ndelete " + id + "\nexit\n")),
+                new PrintWriter(output, true),
+                sessions);
+
+        assertTrue(output.toString().contains("已删除会话: " + id));
+        assertTrue(output.toString().contains("已开始新会话"));
+        assertTrue(sessions.sessions().contains("暂无历史会话"));
     }
 
     private String runCli(String input, boolean upper) throws Exception {

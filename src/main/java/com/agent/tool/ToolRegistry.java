@@ -217,11 +217,14 @@ public class ToolRegistry {
                 args -> {
                     try {
                         Path path = resolveProjectPath(requiredText(args, "path"));
+                        if (isProtectedPath(path)) {
+                            return "列出文件失败: 拒绝访问敏感路径";
+                        }
                         int maxDepth = optionalInt(args, "max_depth", Integer.MAX_VALUE, 0);
                         return "文件列表:\n" + String.join("\n",
                                 lister.listFiles(path, maxDepth).stream()
                                         .map(entry -> path.resolve(entry).normalize())
-                                        .filter(entry -> !isProtectedEnvFile(entry))
+                                        .filter(entry -> !isProtectedPath(entry))
                                         .map(this::projectRelativePath)
                                         .toList());
                     } catch (Exception e) {
@@ -239,8 +242,10 @@ public class ToolRegistry {
                 args -> {
                     try {
                         Path path = resolveProjectPath(requiredText(args, "path"));
-                        if (isProtectedEnvFile(path)) {
-                            return "读取文件失败: 拒绝访问敏感配置文件";
+                        if (isProtectedPath(path)) {
+                            return isProtectedEnvFile(path)
+                                    ? "读取文件失败: 拒绝访问敏感配置文件"
+                                    : "读取文件失败: 拒绝访问敏感路径";
                         }
                         if (args.containsKey("offset") || args.containsKey("limit")) {
                             long offset = optionalLong(args, "offset", 0, 0);
@@ -264,11 +269,14 @@ public class ToolRegistry {
                     try {
                         String keyword = requiredText(args, "keyword");
                         Path path = resolveProjectPath(requiredText(args, "path"));
+                        if (isProtectedPath(path)) {
+                            return "搜索失败: 拒绝访问敏感路径";
+                        }
                         boolean regex = optionalBoolean(args, "regex", false);
                         List<SearchCodeTool.Match> matches = (regex
                                 ? searcher.searchCode(Pattern.compile(keyword), path)
                                 : searcher.searchCode(keyword, path)).stream()
-                                .filter(match -> !isProtectedEnvFile(
+                                .filter(match -> !isProtectedPath(
                                         path.resolve(match.file()).normalize()))
                                 .toList();
                         StringBuilder result = new StringBuilder("搜索结果:\n");
@@ -474,25 +482,25 @@ public class ToolRegistry {
         return result.substring(0, MAX_RESULT_CHARS - marker.length()) + marker;
     }
 
-    /** 避免模型阅读密钥配置文件 */
+    /** 文件工具统一保护版本控制、会话历史以及任意层级的密钥配置路径。 */
+    private static boolean isProtectedPath(Path path) {
+        for (Path part : path.normalize()) {
+            String name = part.toString().toLowerCase(Locale.ROOT);
+            if (name.equals(".git") || name.equals(".agent")
+                    || name.equals(".env") || name.startsWith(".env.")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean isProtectedEnvFile(Path path) {
         Path fileName = path.normalize().getFileName();
         if (fileName == null) {
             return false;
         }
-        String normalizedName = fileName.toString().toLowerCase(Locale.ROOT);
-        return normalizedName.equals(".env") || normalizedName.startsWith(".env.");
-    }
-
-    /** 写操作额外保护版本控制元数据以及任意层级的密钥配置路径。 */
-    private static boolean isProtectedPath(Path path) {
-        for (Path part : path.normalize()) {
-            String name = part.toString().toLowerCase(Locale.ROOT);
-            if (name.equals(".git") || name.equals(".env") || name.startsWith(".env.")) {
-                return true;
-            }
-        }
-        return false;
+        String name = fileName.toString().toLowerCase(Locale.ROOT);
+        return name.equals(".env") || name.startsWith(".env.");
     }
 
     private static String formatCommandResult(ExecuteCommandTool.CommandResult result) {

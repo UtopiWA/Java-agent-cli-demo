@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 
+import com.agent.history.HistoryContextBuilder;
 import com.agent.llm.LLMClient;
 import com.agent.llm.LLMResponse;
 import com.agent.llm.Message;
@@ -14,6 +15,7 @@ import com.agent.tool.ToolRegistry;
 /** 兼容 Lab01 的响应逻辑，并在配置 LLM 后提供 Lab03 的 ReAct Agent。 */
 public class Agent {
     static final int MAX_ITERATIONS = 10;
+    public static final int SYSTEM_PROMPT_VERSION = 1;
     private static final String SYSTEM_PROMPT = """
             你是一个 Java 编程助手 Agent，可以读取、修改和验证用户的项目代码。
 
@@ -28,7 +30,7 @@ public class Agent {
             需要了解项目代码时，请调用工具。
             对“列出—读取—解释”任务，应先列出文件，再读取相关文件后回答。
             修改代码前先读取相关文件；修改后执行最小必要的构建或测试，并根据真实结果答复。
-            不要尝试读取或修改 .env、.git 等敏感路径，也不要请求危险命令。
+            不要尝试读取或修改 .env、.git、.agent 等敏感路径，也不要请求危险命令。
             避免用相同参数反复调用同一工具；失败时应分析 Observation 后调整方案。
             获得工具结果后，再基于结果继续完成任务。
             工具结果可能被截断；信息不足时请缩小范围或使用分页参数继续调用。
@@ -37,24 +39,42 @@ public class Agent {
 
     private final LLMClient llm;
     private final ToolRegistry registry;
+    private final HistoryContextBuilder contextBuilder;
     private final List<Message> history = new ArrayList<>();
+
+    /** 结构化标记一轮是否真正完成，供持久化层决定提交或回滚。 */
+    public record TurnResult(String answer, boolean completed) {
+    }
 
     /** 保留 Lab01 的无参用法；该实例只支持 respond，不支持 run。 */
     public Agent() {
         this.llm = null;
         this.registry = null;
+        this.contextBuilder = null;
     }
 
     /** 创建具备模型决策、工具执行和消息历史能力的 Agent。 */
     public Agent(LLMClient llm, ToolRegistry registry) {
+        this(llm, registry, new HistoryContextBuilder());
+    }
+
+    /** 允许测试或未来 tokenizer 替换上下文预算策略。 */
+    public Agent(LLMClient llm, ToolRegistry registry, HistoryContextBuilder contextBuilder) {
         this.llm = Objects.requireNonNull(llm, "llm");
         this.registry = Objects.requireNonNull(registry, "registry");
+        this.contextBuilder = Objects.requireNonNull(contextBuilder, "contextBuilder");
         resetHistory();
     }
 
     /** 执行一次完整 ReAct 循环，直到模型给出最终回答、调用失败或达到轮数上限。 */
     public String run(String userInput) {
+        return runTurn(userInput).answer();
+    }
+
+    /** 执行可回滚的一轮 ReAct；所有异常终止都恢复到用户输入前的历史。 */
+    public TurnResult runTurn(String userInput) {
         ensureReactConfigured();
+        List<Message> snapshot = List.copyOf(history);
         history.add(Message.user(Objects.requireNonNull(userInput, "userInput")));
         SafetyGuard safetyGuard = new SafetyGuard();
 
@@ -63,9 +83,14 @@ public class Agent {
 
             LLMResponse response;
             try {
-                response = llm.chat(history, registry.getToolDefinitions());
+                response = llm.chat(contextBuilder.build(history), registry.getToolDefinitions());
             } catch (Exception e) {
-                return "LLM 调用失败: " + safeMessage(e);
+                restore(snapshot);
+                return new TurnResult("LLM 调用失败: " + safeMessage(e), false);
+            }
+            if (response == null) {
+                restore(snapshot);
+                return new TurnResult("LLM 调用失败: 响应为空", false);
             }
 
             System.out.printf("Token：输入=%d，输出=%d%n",
@@ -74,7 +99,8 @@ public class Agent {
             if (response.hasToolCalls()) {
                 String invalidCall = safetyGuard.validateCalls(response.toolCalls());
                 if (invalidCall != null) {
-                    return "工具调用被安全守卫拒绝: " + invalidCall;
+                    restore(snapshot);
+                    return new TurnResult("工具调用被安全守卫拒绝: " + invalidCall, false);
                 }
 
                 // 先保存模型的完整调用意图，再按顺序回传每个调用的 Observation
@@ -92,24 +118,46 @@ public class Agent {
                                     response.toolCalls().get(remaining).id(),
                                     "工具调用未执行: 本轮已被安全守卫终止"));
                         }
-                        return refusal;
+                        restore(snapshot);
+                        return new TurnResult(refusal, false);
                     }
 
                     System.out.println("执行工具: " + call.name());
-                    System.out.println("参数: " + call.arguments());
-
                     String result = registry.execute(call.name(), call.arguments());
-                    System.out.println("结果: " + truncate(result, 200)); // 工具调用的终端输出不超过200字符
+                    System.out.println("工具执行完成，结果已作为 Observation 返回模型。");
                     history.add(Message.tool(call.id(), result));
                 }
                 continue;
             }
 
             history.add(Message.assistant(response.content()));
-            return response.content();
+            return new TurnResult(response.content(), true);
         }
 
-        return "达到最大推理轮数限制（" + MAX_ITERATIONS + "）";
+        restore(snapshot);
+        return new TurnResult("达到最大推理轮数限制（" + MAX_ITERATIONS + "）", false);
+    }
+
+    /** 返回不可变快照，供会话事务和测试安全读取。 */
+    public List<Message> historySnapshot() {
+        ensureReactConfigured();
+        return List.copyOf(history);
+    }
+
+    /** 用已校验、已裁剪的会话上下文替换当前内存历史。 */
+    public void replaceHistory(List<Message> messages) {
+        ensureReactConfigured();
+        Objects.requireNonNull(messages, "messages");
+        if (messages.isEmpty() || !"system".equals(messages.get(0).role())) {
+            throw new IllegalArgumentException("历史必须以 system 消息开始");
+        }
+        history.clear();
+        history.addAll(messages);
+    }
+
+    /** 暴露当前版本提示词，供历史恢复时执行版本替换。 */
+    public static String systemPrompt() {
+        return SYSTEM_PROMPT;
     }
 
     /** 清空对话记忆，但保留定义 Agent 身份和工具规则的 system 消息。 */
@@ -123,6 +171,11 @@ public class Agent {
         history.add(Message.system(SYSTEM_PROMPT));
     }
 
+    private void restore(List<Message> snapshot) {
+        history.clear();
+        history.addAll(snapshot);
+    }
+
     private void ensureReactConfigured() {
         if (llm == null || registry == null) {
             throw new IllegalStateException("此 Agent 未配置 LLMClient 和 ToolRegistry");
@@ -133,13 +186,6 @@ public class Agent {
         String message = exception.getMessage();
         return message == null || message.isBlank()
                 ? exception.getClass().getSimpleName() : message;
-    }
-
-    private static String truncate(String text, int maxLength) {
-        if (text == null || text.length() <= maxLength) {
-            return text;
-        }
-        return text.substring(0, maxLength) + "...";
     }
 
     /** Lab01 的简单响应入口，继续支持原有调用方式。 */
