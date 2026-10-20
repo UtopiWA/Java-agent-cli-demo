@@ -8,6 +8,8 @@
 Lab 01：Maven Project + Java CLI + Test + Git
 Lab 02：ListFilesTool + ReadFileTool + SearchCodeTool
 Lab 03：GLM Client + Tool Registry + ReAct Agent
+Lab 04：WriteFileTool + ExecuteCommandTool + Safety Guard
+Lab 05：Session Persistence + History Commands + Context Budget
 ```
 
 ## 环境要求
@@ -158,7 +160,7 @@ Model:    glm-5.3-flash
 Endpoint: https://open.bigmodel.cn/api/paas/v4/chat/completions
 ```
 
-完成 Lab 03 后，项目已经具备模型决策、工具调用和历史记录管理能力。
+完成 Lab 03 后，项目已经具备模型决策、工具调用和内存消息历史管理能力。文件写入、命令执行和持久化会话由后续增量补充。
 
 
 ### 核心组件
@@ -170,7 +172,7 @@ Endpoint: https://open.bigmodel.cn/api/paas/v4/chat/completions
 | `Agent` | 保存多轮历史，根据模型响应决定执行工具、继续推理或返回最终回答 |
 | `Main` | 加载配置、创建对象并处理终端命令，不包含 LLM 协议或文件操作逻辑 |
 
-### 当前 Agent CLI 的运行流程
+### Lab 03 阶段的 Agent CLI 运行流程
 
 ```text
 用户输入
@@ -195,9 +197,9 @@ GlmClient 发送 messages + tools ───────────────�
 
 每次调用 `Agent.run()` 最多进行 10 轮模型请求。一次响应包含多个 `tool_calls` 时，Agent 会按照返回顺序全部执行并逐一回传。工具结果超过 12,000 字符时会先截断，避免上下文无限增长。
 
-### 工具定义与安全边界
+### Lab 03 阶段的工具定义与安全边界
 
-模型当前可以选择以下工具：
+Lab 03 阶段模型可以选择以下三个只读工具：
 
 | 工具 | 必填参数 | 可选参数 |
 |---|---|---|
@@ -226,11 +228,15 @@ mvn clean package
 java -jar target/agent-cli-0.1.0.jar
 ```
 
-系统指令：
+当前版本的系统指令：
 
 ```text
-clear       清空多轮历史，只保留 system 消息
-exit/quit   退出程序
+history       查看当前会话摘要
+sessions      列出全部有效历史会话
+load <id>     加载指定会话并继续对话
+delete <id>   删除指定会话
+clear         开始新的未保存会话，不删除旧记录
+exit/quit     退出程序
 ```
 
 之后可以使用自然语言与模型交流，需要时模型将自动调用工具。
@@ -241,7 +247,7 @@ exit/quit   退出程序
 
 `function.arguments` 是包含 JSON 的字符串，而不是已经展开的 JSON 对象。程序执行工具后，必须使用同一个调用 ID 作为 `tool_call_id` 回传结果。模型据此把多个 Observation 与原始调用正确配对。相关字段可参考[智谱 AI 开放文档](https://docs.bigmodel.cn/)。
 
-下面以“读取 `pom.xml` 并概括依赖”为例，展示一次较完整的数据交换。为便于阅读，请求中只展开 `read_file`；实际程序每轮都会发送三个工具定义。
+下面以“读取 `pom.xml` 并概括依赖”为例，展示一次较完整的数据交换。为便于阅读，请求中只展开 `read_file`；当前程序每轮会发送五个工具定义。
 
 #### 1. Agent 发送首次请求
 
@@ -251,7 +257,7 @@ exit/quit   退出程序
   "messages": [
     {
       "role": "system",
-      "content": "你是一个 Java 编程助手 Agent，可以读取和搜索用户的项目代码……"
+      "content": "你是一个 Java 编程助手 Agent，可以读取、修改和验证用户的项目代码……"
     },
     {
       "role": "user",
@@ -340,7 +346,7 @@ exit/quit   退出程序
   "messages": [
     {
       "role": "system",
-      "content": "你是一个 Java 编程助手 Agent，可以读取和搜索用户的项目代码……"
+      "content": "你是一个 Java 编程助手 Agent，可以读取、修改和验证用户的项目代码……"
     },
     {
       "role": "user",
@@ -369,7 +375,7 @@ exit/quit   退出程序
 }
 ```
 
-这里的 `tool_call_id` 必须与模型返回的 `id` 完全一致。多轮对话时，先前的 `user`、`assistant` 和 `tool` 消息也会继续保留在 `messages` 数组中，直到用户输入 `clear`。
+这里的 `tool_call_id` 必须与模型返回的 `id` 完全一致。多轮对话时，先前的 `user`、`assistant` 和 `tool` 消息会按上下文预算继续发送；完整的安全摘要保存在当前会话中，输入 `clear` 会开始一个新的未保存会话。
 
 #### 4. GLM 返回最终回答
 
@@ -398,3 +404,112 @@ exit/quit   退出程序
 ```
 
 此时 `LLMResponse.hasToolCalls()` 为 `false`，ReAct 循环结束，最终文本由 CLI 输出。
+
+## Lab 04：受控写入、命令执行与安全收尾
+
+### 本次增量
+
+Lab 04 把 Lab 03 的只读分析 Agent 扩展为能够完成编码闭环的 Agent：
+
+- `WriteFileTool`：以 UTF-8 新建或完整覆盖项目内普通文件，限制为 1 MB，并使用同目录临时文件替换；
+- `ExecuteCommandTool`：通过参数数组运行 Java、Javac 或受限 Maven 命令，不接受任意 Shell 字符串；
+- `SafetyGuard`：检查 Tool Call ID，并在连续第三次出现相同工具及规范化参数时终止本轮；
+- `ToolRegistry`：新增 `write_file`、`execute_command`，并在执行前检查严格的 JSON 参数、项目路径和敏感目录；
+- `Agent`：在失败、安全拒绝和最大轮数终止时回滚本轮内存消息。
+
+当前五个模型工具如下：
+
+| 工具 | 必填参数 | 可选参数 |
+|---|---|---|
+| `list_files` | `path` | `max_depth` |
+| `read_file` | `path` | `offset`、`limit` |
+| `search_code` | `keyword`、`path` | `regex` |
+| `write_file` | `path`、`content` | 无 |
+| `execute_command` | `program` | `arguments`、`working_directory`、`timeout_seconds` |
+
+### 安全边界
+
+- 文件操作被限制在程序启动时的项目根目录，拒绝路径逃逸和符号链接绕过；
+- `.env`、`.env.*`、`.git` 和 `.agent` 不允许被模型文件工具访问或修改；
+- 命令程序采用允许列表，Maven 参数另有严格允许列表，超时范围为 1～120 秒；
+- 子进程不继承名称中包含 API Key、Token、Secret 或 Password 的环境变量；
+- 命令标准输出和标准错误各最多保留 6,000 字节，统一工具 Observation 最多保留 12,000 字符；
+- 内存回滚不会撤销已经完成的文件写入或命令副作用。
+
+## Lab 05：聊天记录持久化与会话恢复
+
+### 本次增量
+
+Lab 05 在 ReAct Agent 外增加 `SessionManager`，把一次普通用户输入处理为“Agent 完成 + 历史保存”的提交单元：
+
+- 每个正常完成且成功保存的轮次自动写入 `.agent/history/`；
+- 第一轮通过独立的轻量 GLM 请求生成不超过 30 个字符的会话标题，失败时安全降级为本地标题；
+- `history`、`sessions`、`load <id>`、`delete <id>` 和 `clear` 均由 CLI 本地处理，不发送给模型；
+- 保存前脱敏普通文本，并将工具参数替换为 `{}`、工具结果替换为固定摘要；
+- 加载时校验消息角色、序号、轮次数及 Tool Call/Observation 配对，并再次脱敏；
+- 每次模型请求最多使用 32,000 的保守上下文预算，始终保留 system，并优先保留最新完整轮次。
+
+历史文件名格式为：
+
+```text
+.agent/history/yyyyMMdd-HHmmss-<session-id>.json
+```
+
+保存内容保留会话元数据、普通消息、工具名称、调用 ID、顺序和状态，但不保存文件正文、写入内容、命令输出或其他工具原始载荷。例如：
+
+```json
+{
+  "schema_version": 1,
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "title": "检查并修复项目测试",
+  "turn_count": 1,
+  "system_prompt_version": 1,
+  "messages": [
+    {
+      "sequence": 2,
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {"name": "read_file", "arguments": "{}"}
+        }
+      ]
+    },
+    {
+      "sequence": 3,
+      "role": "tool",
+      "content": "[工具已调用，参数和结果未持久化]",
+      "tool_call_id": "call_1",
+      "tool_event": {
+        "name": "read_file",
+        "status": "success",
+        "details_omitted": true
+      }
+    }
+  ]
+}
+```
+
+时间字段和其他普通消息在实际文件中仍会存在；示例仅突出工具载荷摘要规则。
+
+## 当前完整运行流程
+
+```text
+用户输入
+  -> Main 先识别本地会话命令
+  -> SessionManager 保存本轮开始前的 Agent 快照
+  -> Agent 把有界 messages + 五个 tools 发送给 GLM
+  -> GLM 返回最终文本或 tool_calls
+       ├─ tool_calls：SafetyGuard 校验
+       │              -> ToolRegistry 执行真实工具
+       │              -> 带 tool_call_id 的 Observation 回传 GLM
+       │              -> 继续下一轮，最多 10 轮
+       └─ 最终文本：Agent 返回 completed=true
+  -> SessionManager 脱敏本轮增量并原子保存会话
+       ├─ 保存成功：提交当前会话并输出回答
+       └─ 保存失败：回滚内存历史，输出回答及未保存警告
+```
+
+模型调用、守卫拒绝或最大轮数导致的失败轮次不会进入会话历史。保存失败同样不会提交内存消息，但此前已经发生的文件或命令副作用不会自动回滚。
