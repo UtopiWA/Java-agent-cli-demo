@@ -228,17 +228,6 @@ mvn clean package
 java -jar target/agent-cli-0.1.0.jar
 ```
 
-当前版本的系统指令：
-
-```text
-history       查看当前会话摘要
-sessions      列出全部有效历史会话
-load <id>     加载指定会话并继续对话
-delete <id>   删除指定会话
-clear         开始新的未保存会话，不删除旧记录
-exit/quit     退出程序
-```
-
 之后可以使用自然语言与模型交流，需要时模型将自动调用工具。
 
 ### GLM Chat Completions 与 Tool Calling 协议
@@ -494,6 +483,17 @@ Lab 05 在 ReAct Agent 外增加 `SessionManager`，把一次普通用户输入�
 
 时间字段和其他普通消息在实际文件中仍会存在；示例仅突出工具载荷摘要规则。
 
+当前版本的系统指令：
+
+```text
+history       查看当前会话摘要
+sessions      列出全部有效历史会话
+load <id>     加载指定会话并继续对话
+delete <id>   删除指定会话
+clear         开始新的会话，不删除旧记录
+exit/quit     退出程序
+```
+
 ## 当前完整运行流程
 
 ```text
@@ -512,4 +512,4 @@ Lab 05 在 ReAct Agent 外增加 `SessionManager`，把一次普通用户输入�
        └─ 保存失败：回滚内存历史，输出回答及未保存警告
 ```
 
-模型调用、守卫拒绝或最大轮数导致的失败轮次不会进入会话历史。保存失败同样不会提交内存消息，但此前已经发生的文件或命令副作用不会自动回滚。
+模型调用、守卫拒绝或最大轮数导致的失败轮次不会进入会话历史。保存失败同样不会提交内存消息。
