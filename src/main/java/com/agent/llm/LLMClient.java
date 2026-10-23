@@ -13,11 +13,6 @@ public interface LLMClient {
     /** 根据完整消息历史和可用工具定义生成下一步模型响应。 */
     LLMResponse chat(List<Message> messages, List<ToolDef> tools) throws IOException;
 
-    /** 标题等轻量任务可覆盖该入口以使用更低的推理强度。 */
-    default LLMResponse chatForTitle(List<Message> messages) throws IOException {
-        return chat(messages, List.of());
-    }
-
     /** 意图分类等短输出任务可覆盖该入口以限制推理强度和输出长度。 */
     default LLMResponse chatForIntent(List<Message> messages) throws IOException {
         return chat(messages, List.of());

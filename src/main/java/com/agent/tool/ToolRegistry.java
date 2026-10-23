@@ -2,10 +2,7 @@ package com.agent.tool;
 
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -22,7 +19,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-/** 将 Lab02 的文件工具适配为模型可描述、可按名称执行的统一接口。 */
+/** 注册并执行当前测试任务允许模型调用的五个领域工具。 */
 public class ToolRegistry {
     static final int MAX_RESULT_CHARS = 14_000; // 包含分页正文和元数据
 
@@ -51,8 +48,7 @@ public class ToolRegistry {
             boolean required,
             Integer minLength,
             Long minimum,
-            Long maximum,
-            String itemType) {
+            Long maximum) {
         private Param(
                 String name,
                 String type,
@@ -61,28 +57,14 @@ public class ToolRegistry {
                 Long minimum) {
             this(name, type, description, required,
                     "string".equals(type) ? 1 : null,
-                    minimum, null, null);
+                    minimum, null);
         }
-    }
-
-    /** 以当前工作目录作为唯一可访问的项目根目录。 */
-    public ToolRegistry() {
-        this(Path.of("."));
-    }
-
-    /** 注入项目根目录，便于 CLI 固定安全边界，也便于测试隔离文件。 */
-    public ToolRegistry(Path projectRoot) {
-        this(projectRoot, null);
     }
 
     /** 创建受当前测试任务和轮次状态约束的垂直工具注册表。 */
     public ToolRegistry(TaskExecutionContext taskContext) {
-        this(Objects.requireNonNull(taskContext, "taskContext").projectRoot(), taskContext);
-    }
-
-    private ToolRegistry(Path projectRoot, TaskExecutionContext taskContext) {
-        this.projectRoot = canonicalRoot(projectRoot);
-        this.taskContext = taskContext;
+        this.taskContext = Objects.requireNonNull(taskContext, "taskContext");
+        this.projectRoot = canonicalRoot(taskContext.projectRoot());
         registerFileTools();
         registerMutationTools();
     }
@@ -142,9 +124,6 @@ public class ToolRegistry {
             if (param.maximum() != null) {
                 property.put("maximum", param.maximum());
             }
-            if (param.itemType() != null) {
-                property.putObject("items").put("type", param.itemType());
-            }
             if (param.required()) {
                 required.add(param.name());
             }
@@ -179,8 +158,6 @@ public class ToolRegistry {
         boolean valid = switch (type) {
             case "string" -> value.isTextual();
             case "integer" -> value.isIntegralNumber();
-            case "boolean" -> value.isBoolean();
-            case "array" -> value.isArray();
             default -> false;
         };
         if (!valid) {
@@ -205,14 +182,6 @@ public class ToolRegistry {
                         "参数 " + name + " 不能大于 " + definition.path("maximum").asLong());
             }
         }
-        if (value.isArray()) {
-            String itemType = definition.path("items").path("type").asText();
-            for (JsonNode item : value) {
-                if ("string".equals(itemType) && !item.isTextual()) {
-                    throw new IllegalArgumentException("参数 " + name + " 的元素必须为 string");
-                }
-            }
-        }
     }
 
     /** 注册面向测试生成任务的三个有界只读工具。 */
@@ -227,10 +196,10 @@ public class ToolRegistry {
                 createParameters(
                         new Param("path", "string", "项目根目录内的目录路径，默认 .", false, null),
                         new Param("max_depth", "integer", "最大递归深度，默认 2，范围 0 到 6", false,
-                                null, 0L, 6L, null),
+                                null, 0L, 6L),
                         new Param("offset", "integer", "条目偏移量，默认 0", false, 0L),
                         new Param("limit", "integer", "本页最多返回的条目数，默认 100，范围 1 到 300", false,
-                                null, 1L, 300L, null)),
+                                null, 1L, 300L)),
                 args -> {
                     try {
                         String requested = optionalText(args, "path", ".");
@@ -267,7 +236,7 @@ public class ToolRegistry {
                         new Param("path", "string", "项目根目录内的文件路径", true, null),
                         new Param("offset", "integer", "从第几行开始读取，默认 0", false, 0L),
                         new Param("limit", "integer", "最多读取多少行，默认 200，最大 400", false,
-                                null, 1L, 400L, null)),
+                                null, 1L, 400L)),
                 args -> {
                     try {
                         Path path = resolveProjectPath(requiredText(args, "path"));
@@ -282,9 +251,7 @@ public class ToolRegistry {
                         int offset = optionalInt(args, "offset", 0, 0);
                         int limit = optionalInt(args, "limit", 200, 1);
                         ReadFileTool.ReadPage page = reader.readPage(path, offset, limit);
-                        if (taskContext != null) {
-                            taskContext.noteRead(path);
-                        }
+                        taskContext.noteRead(path);
                         if ("LINE_TOO_LONG".equals(page.status())) {
                             return "读取文件失败: LINE_TOO_LONG"
                                     + "\npath: " + projectRelativePath(path)
@@ -297,7 +264,7 @@ public class ToolRegistry {
                         }
                         String cacheKey = projectRelativePath(path) + ':' + offset + ':' + limit
                                 + ':' + page.fingerprint();
-                        if (taskContext != null && readCache.containsKey(cacheKey)) {
+                        if (readCache.containsKey(cacheKey)) {
                             return "文件区间缓存命中"
                                     + "\ncache_id: " + readCache.get(cacheKey)
                                     + "\npath: " + projectRelativePath(path)
@@ -327,9 +294,9 @@ public class ToolRegistry {
                         new Param("path", "string", "项目根目录内的搜索目录，默认 src", false, null),
                         new Param("offset", "integer", "匹配记录偏移量，默认 0", false, 0L),
                         new Param("limit", "integer", "本页最多返回的匹配数，默认 20，最大 100", false,
-                                null, 1L, 100L, null),
+                                null, 1L, 100L),
                         new Param("context_lines", "integer", "每条匹配前后附带的行数，默认 0，最大 3", false,
-                                null, 0L, 3L, null)),
+                                null, 0L, 3L)),
                 args -> {
                     try {
                         String keyword = requiredText(args, "keyword");
@@ -363,69 +330,9 @@ public class ToolRegistry {
                 }));
     }
 
-    /** 注册能够改变项目状态的工具，并在适配层统一施加路径和参数边界。 */
+    /** 注册由测试任务状态机约束的写入和验证工具。 */
     private void registerMutationTools() {
-        if (taskContext != null) {
-            registerTaskMutationTools();
-            return;
-        }
-        WriteFileTool writer = new WriteFileTool();
-        ExecuteCommandTool commandExecutor = new ExecuteCommandTool();
-
-        tools.put("write_file", new ToolEntry(
-                "write_file",
-                "以 UTF-8 新建或完整覆盖项目内的文本文件，父目录不存在时自动创建",
-                createParameters(
-                        new Param("path", "string", "项目根目录内的目标文件路径", true, null),
-                        new Param("content", "string", "要写入的完整文件内容", true,
-                                0, null, null, null)),
-                args -> {
-                    try {
-                        Path path = resolveWritableProjectPath(requiredText(args, "path"));
-                        if (isProtectedPath(path)) {
-                            return "写入文件失败: 拒绝修改敏感路径";
-                        }
-                        if (isIgnoredPath(path, false)) {
-                            return "写入文件失败: 路径命中 .agentignore";
-                        }
-                        WriteFileTool.WriteResult result = writer.writeFile(
-                                path, requiredTextAllowEmpty(args, "content"));
-                        return "写入文件成功: " + projectRelativePath(path)
-                                + "\n操作: " + (result.created() ? "新建" : "覆盖")
-                                + "\n写入字节数: " + result.bytesWritten();
-                    } catch (Exception e) {
-                        return "写入文件失败: " + errorMessage(e);
-                    }
-                }));
-
-        tools.put("execute_command", new ToolEntry(
-                "execute_command",
-                "在项目内参数化执行受允许列表约束的开发命令，不接受 Shell 命令字符串",
-                createParameters(
-                        new Param("program", "string", "可执行程序名，例如 java、javac 或 mvn", true, null),
-                        new Param("arguments", "array", "按顺序传递给程序的字符串参数", false,
-                                null, null, null, "string"),
-                        new Param("working_directory", "string", "项目根目录内的工作目录，默认 .", false, null),
-                        new Param("timeout_seconds", "integer", "超时秒数，默认 30，范围 1 到 120", false,
-                                null, 1L, 120L, null)),
-                args -> {
-                    try {
-                        String workingDirectory = optionalText(args, "working_directory", ".");
-                        Path directory = resolveProjectPath(workingDirectory);
-                        if (!Files.isDirectory(directory)) {
-                            return "执行命令失败: 工作目录不是目录";
-                        }
-                        int timeout = optionalInt(args, "timeout_seconds", 30, 1);
-                        ExecuteCommandTool.CommandResult result = commandExecutor.execute(
-                                directory,
-                                requiredText(args, "program"),
-                                optionalStringList(args, "arguments"),
-                                Duration.ofSeconds(timeout));
-                        return formatCommandResult(result);
-                    } catch (Exception e) {
-                        return "执行命令失败: " + errorMessage(e);
-                    }
-                }));
+        registerTaskMutationTools();
     }
 
     /** 解析并规范化工具路径，同时阻止绝对路径、.. 和符号链接。 */
@@ -443,32 +350,6 @@ public class ToolRegistry {
             throw new SecurityException("路径通过符号链接逃逸项目根目录: " + value);
         }
         return realPath;
-    }
-
-    /** 为可能尚不存在的写入目标验证词法边界和每个已存在路径分量。 */
-    private Path resolveWritableProjectPath(String value) throws IOException {
-        Path requested = Path.of(value);
-        Path candidate = requested.isAbsolute()
-                ? requested.toAbsolutePath().normalize()
-                : projectRoot.resolve(requested).normalize();
-        if (!candidate.startsWith(projectRoot) || candidate.equals(projectRoot)) {
-            throw new SecurityException("路径超出项目根目录或指向根目录: " + value);
-        }
-
-        Path current = projectRoot;
-        for (Path part : projectRoot.relativize(candidate)) {
-            current = current.resolve(part);
-            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
-                if (Files.isSymbolicLink(current)) {
-                    throw new SecurityException("路径包含符号链接: " + value);
-                }
-                Path realPath = current.toRealPath();
-                if (!realPath.startsWith(projectRoot)) {
-                    throw new SecurityException("路径逃逸项目根目录: " + value);
-                }
-            }
-        }
-        return candidate;
     }
 
     /** 工具间统一交换项目根目录相对路径，避免后续 read_file 误解子目录结果。 */
@@ -533,24 +414,6 @@ public class ToolRegistry {
         return value;
     }
 
-    private static boolean optionalBoolean(
-            Map<String, String> args, String name, boolean defaultValue) {
-        String raw = args.get(name);
-        return raw == null ? defaultValue : Boolean.parseBoolean(raw);
-    }
-
-    private List<String> optionalStringList(Map<String, String> args, String name)
-            throws IOException {
-        String raw = args.get(name);
-        if (raw == null) {
-            return List.of();
-        }
-        JsonNode values = mapper.readTree(raw);
-        List<String> result = new ArrayList<>();
-        values.forEach(value -> result.add(value.textValue()));
-        return List.copyOf(result);
-    }
-
     /** 截断写入模型上下文的 Observation，并明确标记原始长度。 */
     private static String limitResult(String result) {
         if (result == null || result.length() <= MAX_RESULT_CHARS) {
@@ -573,7 +436,7 @@ public class ToolRegistry {
                         + "@RepeatedTest、@TestFactory 或 @TestTemplate 代替 @Test",
                 createParameters(new Param("content", "string",
                         "非空的完整 Java 测试源码，最大 24 KiB；至少包含一个普通 @Test 方法",
-                        true, 1, null, null, null)),
+                        true, 1, null, null)),
                 args -> taskContext.writeCandidate(requiredText(args, "content"))));
 
         tools.put("execute_command", new ToolEntry(
@@ -602,14 +465,6 @@ public class ToolRegistry {
         }
         String name = fileName.toString().toLowerCase(Locale.ROOT);
         return name.equals(".env") || name.startsWith(".env.");
-    }
-
-    private static String formatCommandResult(ExecuteCommandTool.CommandResult result) {
-        return "命令执行结果:"
-                + "\n退出码: " + result.exitCode()
-                + "\n超时: " + result.timedOut()
-                + "\n标准输出:\n" + result.standardOutput()
-                + "\n标准错误:\n" + result.standardError();
     }
 
     private static String nullable(Object value) {

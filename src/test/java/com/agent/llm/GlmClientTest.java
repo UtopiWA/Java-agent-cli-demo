@@ -121,7 +121,7 @@ class GlmClientTest {
     }
 
     @Test
-    void shouldUseLowReasoningForTitleAndParseTextBlocks() throws Exception {
+    void shouldParseTextBlocks() throws Exception {
         AtomicReference<String> capturedBody = new AtomicReference<>();
         OkHttpClient httpClient = fakeHttpClient(
                 200,
@@ -132,12 +132,8 @@ class GlmClientTest {
         GlmClient client = new GlmClient(
                 "test-key", httpClient, "https://example.invalid/chat", mapper);
 
-        LLMResponse response = client.chatForTitle(List.of(Message.user("生成标题")));
+        LLMResponse response = client.chat(List.of(Message.user("读取文本")), List.of());
 
-        JsonNode request = mapper.readTree(capturedBody.get());
-        assertEquals("low", request.path("reasoning_effort").asText());
-        assertEquals(1024, request.path("max_tokens").asInt());
-        assertEquals(false, request.path("stream").asBoolean());
         assertEquals("会话标题", response.content());
     }
 

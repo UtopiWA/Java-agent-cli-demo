@@ -56,12 +56,6 @@ public final class GlmClient implements LLMClient {
         return execute(requestJson);
     }
 
-    /** GLM-5.3-Flash 强制思考；标题任务使用 low 以避免默认 max 推理导致超时降级。 */
-    @Override
-    public LLMResponse chatForTitle(List<Message> messages) throws IOException {
-        return executeLightweight(messages, 1024);
-    }
-
     /** 意图只允许返回一个枚举值，避免为分类消耗正式 Agent 的输出额度。 */
     @Override
     public LLMResponse chatForIntent(List<Message> messages) throws IOException {

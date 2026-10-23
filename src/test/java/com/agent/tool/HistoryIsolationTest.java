@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import com.agent.task.TaskTestProjects;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 class HistoryIsolationTest {
@@ -19,7 +20,7 @@ class HistoryIsolationTest {
         Path history = root.resolve(".agent/history");
         Files.createDirectories(history);
         Files.writeString(history.resolve("session.json"), "private-history-marker");
-        ToolRegistry registry = new ToolRegistry(root);
+        ToolRegistry registry = TaskTestProjects.toolRegistry(root);
 
         String listed = registry.execute("list_files", args("path", "."));
         String read = registry.execute("read_file", args("path", ".agent/history/session.json"));
@@ -33,7 +34,7 @@ class HistoryIsolationTest {
         assertFalse(listed.contains(".agent"));
         assertFalse(searched.contains("private-history-marker"));
         assertTrue(read.contains("拒绝访问敏感路径"));
-        assertTrue(written.contains("拒绝修改敏感路径"));
+        assertTrue(written.contains("未知参数: path"));
     }
 
     private String args(String name, String value) {

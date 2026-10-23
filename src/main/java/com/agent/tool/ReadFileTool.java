@@ -10,8 +10,6 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 /** 读取 UTF-8 文本文件，并支持按行分页。 */
 public class ReadFileTool {
@@ -89,32 +87,6 @@ public class ReadFileTool {
                 "OK", content.toString(), lines.size(), offset + 1,
                 offset + returned, hasMore, hasMore ? index : null,
                 fingerprint, null, null);
-    }
-
-    /** 一次读取完整文本，适用于体积较小的文件。 */
-    public String readFile(Path path) throws IOException {
-        validateFile(path);
-        return Files.readString(path, StandardCharsets.UTF_8);
-    }
-
-    /**
-     * 从 offset 行开始读取至多 limit 行，避免把大文件全部载入内存。
-     */
-    public String readFile(Path path, long offset, long limit) throws IOException {
-        validateFile(path);
-        if (offset < 0) {
-            throw new IllegalArgumentException("offset must not be negative");
-        }
-        if (limit < 1) {
-            throw new IllegalArgumentException("limit must be positive");
-        }
-
-        try (Stream<String> lines = Files.lines(path, StandardCharsets.UTF_8)) {
-            return lines
-                    .skip(offset)
-                    .limit(limit)
-                    .collect(Collectors.joining(System.lineSeparator()));
-        }
     }
 
     private static void validateFile(Path path) throws IOException {

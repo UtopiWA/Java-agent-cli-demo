@@ -1,8 +1,13 @@
 package com.agent.task;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+
+import com.agent.task.TaskModels.RoundType;
+import com.agent.tool.ToolRegistry;
 
 public final class TaskTestProjects {
     private TaskTestProjects() {
@@ -59,5 +64,19 @@ public final class TaskTestProjects {
                     }
                 }
                 """;
+    }
+
+    /** 为工具协议测试建立一个真实的分析轮次，避免绕过领域任务边界。 */
+    public static ToolRegistry toolRegistry(Path root) throws Exception {
+        calculator(root);
+        TaskManager manager = new TaskManager(root);
+        var created = manager.create("fixture.calculator.Calculator", false, true);
+        var round = manager.startRound(created.task(), RoundType.ANALYSIS, "工具协议测试");
+        var task = manager.store().load(created.task().id());
+        var context = new TaskExecutionContext(
+                manager.store(), task, round,
+                manager.inspector().inspect(task.targetSource()),
+                new PrintWriter(new StringWriter(), true));
+        return new ToolRegistry(context);
     }
 }
