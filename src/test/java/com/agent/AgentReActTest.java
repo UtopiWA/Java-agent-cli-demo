@@ -46,7 +46,7 @@ class AgentReActTest {
         assertEquals("call_1", secondRequest.get(2).toolCalls().get(0).id());
         assertEquals("tool", secondRequest.get(3).role());
         assertEquals("call_1", secondRequest.get(3).toolCallId());
-        assertTrue(secondRequest.get(3).content().startsWith("文件列表:"));
+        assertTrue(secondRequest.get(3).content().startsWith("目录树:"));
     }
 
     @Test
@@ -97,7 +97,8 @@ class AgentReActTest {
         assertEquals(3, fake.requests().size());
         List<Message> finalRequest = fake.requests().get(2);
         assertEquals("call_list", finalRequest.get(3).toolCallId());
-        assertTrue(finalRequest.get(3).content().contains("src/Demo.java"));
+        assertTrue(finalRequest.get(3).content().contains("src/"));
+        assertTrue(finalRequest.get(3).content().contains("Demo.java"));
         assertEquals("call_read", finalRequest.get(5).toolCallId());
         assertTrue(finalRequest.get(5).content().contains("class Demo"));
     }

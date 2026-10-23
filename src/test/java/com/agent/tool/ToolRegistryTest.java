@@ -33,6 +33,10 @@ class ToolRegistryTest {
                 .path("properties").path("max_depth").path("type").asText());
         assertEquals(0, list.parameters()
                 .path("properties").path("max_depth").path("minimum").asInt());
+        assertEquals(6, list.parameters()
+                .path("properties").path("max_depth").path("maximum").asInt());
+        assertTrue(list.parameters().path("properties").has("offset"));
+        assertTrue(list.parameters().path("properties").has("limit"));
         LLMClient.ToolDef read = definitions.get(1);
         assertTrue(read.parameters().path("properties").has("offset"));
         assertTrue(read.parameters().path("properties").has("limit"));
@@ -40,9 +44,9 @@ class ToolRegistryTest {
         assertEquals("object", search.parameters().path("type").asText());
         assertTrue(search.parameters().path("properties").has("keyword"));
         assertTrue(search.parameters().path("properties").has("path"));
-        assertEquals("boolean", search.parameters()
-                .path("properties").path("regex").path("type").asText());
-        assertEquals(2, search.parameters().path("required").size());
+        assertFalse(search.parameters().path("properties").has("regex"));
+        assertTrue(search.parameters().path("properties").has("context_lines"));
+        assertEquals(1, search.parameters().path("required").size());
 
         LLMClient.ToolDef write = definitions.get(3);
         assertTrue(write.parameters().path("properties").has("content"));
@@ -172,7 +176,25 @@ class ToolRegistryTest {
     }
 
     @Test
-    void shouldSupportOptionalDepthPaginationAndRegex(@TempDir Path root) throws Exception {
+    void shouldRejectDirectAccessToIgnoredPaths(@TempDir Path root) throws Exception {
+        Files.writeString(root.resolve(".agentignore"), "private/\n");
+        Files.createDirectories(root.resolve("private"));
+        Files.writeString(root.resolve("private/Secret.java"), "class Secret {}");
+        ToolRegistry registry = new ToolRegistry(root);
+
+        String listed = registry.execute("list_files", "{\"path\":\"private\"}");
+        String read = registry.execute(
+                "read_file", "{\"path\":\"private/Secret.java\"}");
+        String searched = registry.execute("search_code",
+                "{\"keyword\":\"Secret\",\"path\":\"private\"}");
+
+        assertTrue(listed.contains("命中 .agentignore"));
+        assertTrue(read.contains("命中 .agentignore"));
+        assertTrue(searched.contains("命中 .agentignore"));
+    }
+
+    @Test
+    void shouldSupportBoundedReadListAndLiteralSearch(@TempDir Path root) throws Exception {
         Files.createDirectories(root.resolve("src/deep"));
         Files.writeString(root.resolve("top.txt"), "first\nsecond\nthird");
         Files.writeString(root.resolve("src/deep/Demo.java"), "class Demo42 {}");
@@ -188,19 +210,21 @@ class ToolRegistryTest {
                 .put("limit", 1)
                 .toString());
         String searched = registry.execute("search_code", mapper.createObjectNode()
-                .put("keyword", "Demo\\d+")
+                .put("keyword", "Demo42")
                 .put("path", ".")
-                .put("regex", true)
+                .put("context_lines", 1)
                 .toString());
 
         assertTrue(listed.contains("top.txt"));
         assertFalse(listed.contains("Demo.java"));
-        assertEquals("文件内容:\nsecond", read);
+        assertTrue(read.contains("2 | second"));
+        assertTrue(read.contains("returned_range: 2-2"));
         assertTrue(searched.contains("src/deep/Demo.java:1"));
+        assertTrue(searched.contains("> 1 | class Demo42 {}"));
     }
 
     @Test
-    void shouldLimitLargeToolResultsBeforeReturningObservation(@TempDir Path root)
+    void shouldReportSingleLineThatCannotFitAReadPage(@TempDir Path root)
             throws Exception {
         Files.writeString(root.resolve("large.txt"), "x".repeat(
                 ToolRegistry.MAX_RESULT_CHARS * 2));
@@ -209,8 +233,9 @@ class ToolRegistryTest {
                 "read_file", "{\"path\":\"large.txt\"}");
 
         assertTrue(result.length() <= ToolRegistry.MAX_RESULT_CHARS);
-        assertTrue(result.contains("工具结果已截断"));
-        assertTrue(result.contains("原始长度="));
+        assertTrue(result.contains("LINE_TOO_LONG"));
+        assertTrue(result.contains("line: 1"));
+        assertTrue(result.contains("line_length:"));
     }
 
     @Test

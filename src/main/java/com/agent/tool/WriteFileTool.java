@@ -12,7 +12,7 @@ import java.nio.file.StandardCopyOption;
 public final class WriteFileTool {
     static final int MAX_CONTENT_BYTES = 1_000_000;
 
-    public record WriteResult(boolean created, int bytesWritten) {
+    public record WriteResult(boolean created, int bytesWritten, boolean atomic) {
     }
 
     /** 写入完整文本；目标父目录不存在时自动创建。 */
@@ -49,21 +49,23 @@ public final class WriteFileTool {
         Path temporary = Files.createTempFile(parent, ".agent-write-", ".tmp");
         try {
             Files.write(temporary, bytes);
-            moveIntoPlace(temporary, target);
+            boolean atomic = moveIntoPlace(temporary, target);
+            return new WriteResult(created, bytes.length, atomic);
         } finally {
             Files.deleteIfExists(temporary);
         }
-        return new WriteResult(created, bytes.length);
     }
 
     /** 优先原子替换；文件系统不支持时退化为同目录普通替换。 */
-    private static void moveIntoPlace(Path source, Path target) throws IOException {
+    private static boolean moveIntoPlace(Path source, Path target) throws IOException {
         try {
             Files.move(source, target,
                     StandardCopyOption.ATOMIC_MOVE,
                     StandardCopyOption.REPLACE_EXISTING);
+            return true;
         } catch (AtomicMoveNotSupportedException ignored) {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            return false;
         }
     }
 }

@@ -13,9 +13,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.regex.Pattern;
 
 import com.agent.llm.LLMClient;
+import com.agent.task.TaskExecutionContext;
+import com.agent.task.TaskModels.TestAction;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -23,11 +24,13 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /** 将 Lab02 的文件工具适配为模型可描述、可按名称执行的统一接口。 */
 public class ToolRegistry {
-    static final int MAX_RESULT_CHARS = 12_000; // 工具返回结果的最大长度
+    static final int MAX_RESULT_CHARS = 14_000; // 包含分页正文和元数据
 
     private final Map<String, ToolEntry> tools = new LinkedHashMap<>();
     private final ObjectMapper mapper = new ObjectMapper();
     private final Path projectRoot;
+    private final TaskExecutionContext taskContext;
+    private final Map<String, String> readCache = new LinkedHashMap<>();
 
     public record ToolEntry(
             String name,
@@ -69,7 +72,17 @@ public class ToolRegistry {
 
     /** 注入项目根目录，便于 CLI 固定安全边界，也便于测试隔离文件。 */
     public ToolRegistry(Path projectRoot) {
+        this(projectRoot, null);
+    }
+
+    /** 创建受当前测试任务和轮次状态约束的垂直工具注册表。 */
+    public ToolRegistry(TaskExecutionContext taskContext) {
+        this(Objects.requireNonNull(taskContext, "taskContext").projectRoot(), taskContext);
+    }
+
+    private ToolRegistry(Path projectRoot, TaskExecutionContext taskContext) {
         this.projectRoot = canonicalRoot(projectRoot);
+        this.taskContext = taskContext;
         registerFileTools();
         registerMutationTools();
     }
@@ -202,7 +215,7 @@ public class ToolRegistry {
         }
     }
 
-    /** 只做协议适配，实际列举、读取和搜索仍由 Lab02 的实现完成。 */
+    /** 注册面向测试生成任务的三个有界只读工具。 */
     private void registerFileTools() {
         ListFilesTool lister = new ListFilesTool();
         ReadFileTool reader = new ReadFileTool();
@@ -210,23 +223,38 @@ public class ToolRegistry {
 
         tools.put("list_files", new ToolEntry(
                 "list_files",
-                "递归列出项目内指定目录下的文件，返回相对于项目根目录的路径列表",
+                "分页查看项目目录树；默认从项目根目录向下查看两层",
                 createParameters(
-                        new Param("path", "string", "项目根目录内的目录路径", true, null),
-                        new Param("max_depth", "integer", "最大递归深度，0 表示仅根节点", false, 0L)),
+                        new Param("path", "string", "项目根目录内的目录路径，默认 .", false, null),
+                        new Param("max_depth", "integer", "最大递归深度，默认 2，范围 0 到 6", false,
+                                null, 0L, 6L, null),
+                        new Param("offset", "integer", "条目偏移量，默认 0", false, 0L),
+                        new Param("limit", "integer", "本页最多返回的条目数，默认 100，范围 1 到 300", false,
+                                null, 1L, 300L, null)),
                 args -> {
                     try {
-                        Path path = resolveProjectPath(requiredText(args, "path"));
+                        String requested = optionalText(args, "path", ".");
+                        Path path = resolveProjectPath(requested);
                         if (isProtectedPath(path)) {
                             return "列出文件失败: 拒绝访问敏感路径";
                         }
-                        int maxDepth = optionalInt(args, "max_depth", Integer.MAX_VALUE, 0);
-                        return "文件列表:\n" + String.join("\n",
-                                lister.listFiles(path, maxDepth).stream()
-                                        .map(entry -> path.resolve(entry).normalize())
-                                        .filter(entry -> !isProtectedPath(entry))
-                                        .map(this::projectRelativePath)
-                                        .toList());
+                        if (isIgnoredPath(path, true)) {
+                            return "列出文件失败: 路径命中 .agentignore";
+                        }
+                        int maxDepth = optionalInt(args, "max_depth", 2, 0);
+                        int offset = optionalInt(args, "offset", 0, 0);
+                        int limit = optionalInt(args, "limit", 100, 1);
+                        ListFilesTool.TreePage page = lister.treePage(
+                                projectRoot, path, maxDepth, offset, limit);
+                        return "目录树:\n" + page.tree()
+                                + "\n元数据:"
+                                + "\npath: " + (requested.isBlank() ? "." : requested)
+                                + "\nmax_depth: " + maxDepth
+                                + "\nreturned_entries: " + page.returnedEntries()
+                                + "\nhas_more: " + page.hasMore()
+                                + "\nnext_offset: " + nullable(page.nextOffset())
+                                + "\nscan_limited: " + page.scanLimited()
+                                + "\nvisited_entries: " + page.visitedEntries();
                     } catch (Exception e) {
                         return "列出文件失败: " + errorMessage(e);
                     }
@@ -238,7 +266,8 @@ public class ToolRegistry {
                 createParameters(
                         new Param("path", "string", "项目根目录内的文件路径", true, null),
                         new Param("offset", "integer", "从第几行开始读取，默认 0", false, 0L),
-                        new Param("limit", "integer", "最多读取多少行，默认读取至文件末尾", false, 1L)),
+                        new Param("limit", "integer", "最多读取多少行，默认 200，最大 400", false,
+                                null, 1L, 400L, null)),
                 args -> {
                     try {
                         Path path = resolveProjectPath(requiredText(args, "path"));
@@ -247,12 +276,44 @@ public class ToolRegistry {
                                     ? "读取文件失败: 拒绝访问敏感配置文件"
                                     : "读取文件失败: 拒绝访问敏感路径";
                         }
-                        if (args.containsKey("offset") || args.containsKey("limit")) {
-                            long offset = optionalLong(args, "offset", 0, 0);
-                            long limit = optionalLong(args, "limit", Long.MAX_VALUE, 1);
-                            return "文件内容:\n" + reader.readFile(path, offset, limit);
+                        if (isIgnoredPath(path, false)) {
+                            return "读取文件失败: 路径命中 .agentignore";
                         }
-                        return "文件内容:\n" + reader.readFile(path);
+                        int offset = optionalInt(args, "offset", 0, 0);
+                        int limit = optionalInt(args, "limit", 200, 1);
+                        ReadFileTool.ReadPage page = reader.readPage(path, offset, limit);
+                        if (taskContext != null) {
+                            taskContext.noteRead(path);
+                        }
+                        if ("LINE_TOO_LONG".equals(page.status())) {
+                            return "读取文件失败: LINE_TOO_LONG"
+                                    + "\npath: " + projectRelativePath(path)
+                                    + "\nline: " + page.oversizedLine()
+                                    + "\nline_length: " + page.oversizedLineLength()
+                                    + "\ntotal_lines: " + page.totalLines()
+                                    + "\nhas_more: " + page.hasMore()
+                                    + "\nnext_offset: " + nullable(page.nextOffset())
+                                    + "\nfingerprint: " + page.fingerprint();
+                        }
+                        String cacheKey = projectRelativePath(path) + ':' + offset + ':' + limit
+                                + ':' + page.fingerprint();
+                        if (taskContext != null && readCache.containsKey(cacheKey)) {
+                            return "文件区间缓存命中"
+                                    + "\ncache_id: " + readCache.get(cacheKey)
+                                    + "\npath: " + projectRelativePath(path)
+                                    + "\noffset: " + offset
+                                    + "\nlimit: " + limit
+                                    + "\nfingerprint: " + page.fingerprint();
+                        }
+                        readCache.put(cacheKey, Integer.toHexString(cacheKey.hashCode()));
+                        return "文件内容:\n" + page.content()
+                                + "\n元数据:"
+                                + "\npath: " + projectRelativePath(path)
+                                + "\ntotal_lines: " + page.totalLines()
+                                + "\nreturned_range: " + page.startLine() + "-" + page.endLine()
+                                + "\nhas_more: " + page.hasMore()
+                                + "\nnext_offset: " + nullable(page.nextOffset())
+                                + "\nfingerprint: " + page.fingerprint();
                     } catch (Exception e) {
                         return "读取文件失败: " + errorMessage(e);
                     }
@@ -260,32 +321,42 @@ public class ToolRegistry {
 
         tools.put("search_code", new ToolEntry(
                 "search_code",
-                "在项目内指定目录中搜索代码，支持字面量或正则表达式",
+                "在项目内的 Java 文件中执行大小写敏感的字面量搜索，并可返回少量上下文",
                 createParameters(
-                        new Param("keyword", "string", "搜索关键字或正则表达式", true, null),
-                        new Param("path", "string", "项目根目录内的搜索目录", true, null),
-                        new Param("regex", "boolean", "是否把 keyword 作为正则表达式，默认 false", false, null)),
+                        new Param("keyword", "string", "普通文本关键字，长度 1 到 200", true, null),
+                        new Param("path", "string", "项目根目录内的搜索目录，默认 src", false, null),
+                        new Param("offset", "integer", "匹配记录偏移量，默认 0", false, 0L),
+                        new Param("limit", "integer", "本页最多返回的匹配数，默认 20，最大 100", false,
+                                null, 1L, 100L, null),
+                        new Param("context_lines", "integer", "每条匹配前后附带的行数，默认 0，最大 3", false,
+                                null, 0L, 3L, null)),
                 args -> {
                     try {
                         String keyword = requiredText(args, "keyword");
-                        Path path = resolveProjectPath(requiredText(args, "path"));
+                        if (keyword.length() > 200) {
+                            throw new IllegalArgumentException("参数 keyword 长度不能超过 200");
+                        }
+                        Path path = resolveProjectPath(optionalText(args, "path", "src"));
                         if (isProtectedPath(path)) {
                             return "搜索失败: 拒绝访问敏感路径";
                         }
-                        boolean regex = optionalBoolean(args, "regex", false);
-                        List<SearchCodeTool.Match> matches = (regex
-                                ? searcher.searchCode(Pattern.compile(keyword), path)
-                                : searcher.searchCode(keyword, path)).stream()
-                                .filter(match -> !isProtectedPath(
-                                        path.resolve(match.file()).normalize()))
-                                .toList();
-                        StringBuilder result = new StringBuilder("搜索结果:\n");
-                        matches.forEach(match -> result
-                                .append(projectRelativePath(
-                                        path.resolve(match.file()).normalize())).append(':')
-                                .append(match.line()).append(": ")
-                                .append(match.content()).append('\n'));
-                        return result.toString();
+                        if (isIgnoredPath(path, true)) {
+                            return "搜索失败: 路径命中 .agentignore";
+                        }
+                        int offset = optionalInt(args, "offset", 0, 0);
+                        int limit = optionalInt(args, "limit", 20, 1);
+                        int contextLines = optionalInt(args, "context_lines", 0, 0);
+                        SearchCodeTool.SearchPage page = searcher.searchPage(
+                                projectRoot, path, keyword, offset, limit, contextLines);
+                        return "搜索结果:\n" + page.content()
+                                + "\n元数据:"
+                                + "\nreturned_matches: " + page.returnedMatches()
+                                + "\nhas_more: " + page.hasMore()
+                                + "\nnext_offset: " + nullable(page.nextOffset())
+                                + "\nscan_limited: " + page.scanLimited()
+                                + "\nscan_limit_reason: " + nullable(page.scanLimitReason())
+                                + "\nscanned_files: " + page.scannedFiles()
+                                + "\nscanned_bytes: " + page.scannedBytes();
                     } catch (Exception e) {
                         return "搜索失败: " + errorMessage(e);
                     }
@@ -294,6 +365,10 @@ public class ToolRegistry {
 
     /** 注册能够改变项目状态的工具，并在适配层统一施加路径和参数边界。 */
     private void registerMutationTools() {
+        if (taskContext != null) {
+            registerTaskMutationTools();
+            return;
+        }
         WriteFileTool writer = new WriteFileTool();
         ExecuteCommandTool commandExecutor = new ExecuteCommandTool();
 
@@ -309,6 +384,9 @@ public class ToolRegistry {
                         Path path = resolveWritableProjectPath(requiredText(args, "path"));
                         if (isProtectedPath(path)) {
                             return "写入文件失败: 拒绝修改敏感路径";
+                        }
+                        if (isIgnoredPath(path, false)) {
+                            return "写入文件失败: 路径命中 .agentignore";
                         }
                         WriteFileTool.WriteResult result = writer.writeFile(
                                 path, requiredTextAllowEmpty(args, "content"));
@@ -482,16 +560,39 @@ public class ToolRegistry {
         return result.substring(0, MAX_RESULT_CHARS - marker.length()) + marker;
     }
 
-    /** 文件工具统一保护版本控制、会话历史以及任意层级的密钥配置路径。 */
-    private static boolean isProtectedPath(Path path) {
-        for (Path part : path.normalize()) {
-            String name = part.toString().toLowerCase(Locale.ROOT);
-            if (name.equals(".git") || name.equals(".agent")
-                    || name.equals(".env") || name.startsWith(".env.")) {
-                return true;
-            }
-        }
-        return false;
+    /** 保护规则只按项目内相对路径判断，避免项目父目录名称造成误判。 */
+    private boolean isProtectedPath(Path path) {
+        return IgnoreRules.isAlwaysExcluded(projectRoot, path);
+    }
+
+    private void registerTaskMutationTools() {
+        tools.put("write_file", new ToolEntry(
+                "write_file",
+                "提交当前轮次的完整 JUnit 5 测试候选；写入路径由任务固定，不能指定 path。"
+                        + "第一版至少需要一个普通 @Test 方法；不要用 @ParameterizedTest、"
+                        + "@RepeatedTest、@TestFactory 或 @TestTemplate 代替 @Test",
+                createParameters(new Param("content", "string",
+                        "非空的完整 Java 测试源码，最大 24 KiB；至少包含一个普通 @Test 方法",
+                        true, 1, null, null, null)),
+                args -> taskContext.writeCandidate(requiredText(args, "content"))));
+
+        tools.put("execute_command", new ToolEntry(
+                "execute_command",
+                "执行受状态机约束的 Maven 测试动作，不接受命令、参数、工作目录或测试类名",
+                createParameters(new Param("action", "string",
+                        "仅允许 baseline_test、target_test、regression_test", true, null)),
+                args -> {
+                    try {
+                        TestAction action = TestAction.valueOf(requiredText(args, "action"));
+                        return taskContext.execute(action);
+                    } catch (IllegalArgumentException e) {
+                        return "执行测试失败: action 仅允许 baseline_test、target_test、regression_test";
+                    }
+                }));
+    }
+
+    private boolean isIgnoredPath(Path path, boolean directory) throws IOException {
+        return IgnoreRules.load(projectRoot).isIgnored(projectRoot, path, directory);
     }
 
     private static boolean isProtectedEnvFile(Path path) {
@@ -509,6 +610,10 @@ public class ToolRegistry {
                 + "\n超时: " + result.timedOut()
                 + "\n标准输出:\n" + result.standardOutput()
                 + "\n标准错误:\n" + result.standardError();
+    }
+
+    private static String nullable(Object value) {
+        return value == null ? "null" : value.toString();
     }
 
     private static String errorMessage(Exception exception) {

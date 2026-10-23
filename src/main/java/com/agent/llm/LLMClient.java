@@ -17,4 +17,9 @@ public interface LLMClient {
     default LLMResponse chatForTitle(List<Message> messages) throws IOException {
         return chat(messages, List.of());
     }
+
+    /** 意图分类等短输出任务可覆盖该入口以限制推理强度和输出长度。 */
+    default LLMResponse chatForIntent(List<Message> messages) throws IOException {
+        return chat(messages, List.of());
+    }
 }

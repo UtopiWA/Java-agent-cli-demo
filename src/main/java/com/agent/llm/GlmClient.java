@@ -59,9 +59,20 @@ public final class GlmClient implements LLMClient {
     /** GLM-5.3-Flash 强制思考；标题任务使用 low 以避免默认 max 推理导致超时降级。 */
     @Override
     public LLMResponse chatForTitle(List<Message> messages) throws IOException {
+        return executeLightweight(messages, 1024);
+    }
+
+    /** 意图只允许返回一个枚举值，避免为分类消耗正式 Agent 的输出额度。 */
+    @Override
+    public LLMResponse chatForIntent(List<Message> messages) throws IOException {
+        return executeLightweight(messages, 32);
+    }
+
+    private LLMResponse executeLightweight(List<Message> messages, int maxTokens)
+            throws IOException {
         ObjectNode requestJson = buildRequest(messages, List.of());
         requestJson.put("reasoning_effort", "low");
-        requestJson.put("max_tokens", 1024);
+        requestJson.put("max_tokens", maxTokens);
         requestJson.put("stream", false);
         return execute(requestJson);
     }
@@ -174,7 +185,7 @@ public final class GlmClient implements LLMClient {
         return content.toString();
     }
 
-    private static List<ToolCall> parseToolCalls(JsonNode callsNode) {
+    private static List<ToolCall> parseToolCalls(JsonNode callsNode) throws IOException {
         if (!callsNode.isArray() || callsNode.isEmpty()) {
             return null;
         }
@@ -182,11 +193,15 @@ public final class GlmClient implements LLMClient {
         List<ToolCall> calls = new ArrayList<>();
         for (JsonNode callNode : callsNode) {
             JsonNode function = callNode.path("function");
+            JsonNode arguments = function.path("arguments");
+            if (!arguments.isTextual()) {
+                throw new IOException("响应中的工具调用 arguments 必须是 JSON 字符串");
+            }
             calls.add(new ToolCall(
                     callNode.path("id").asText(),
                     new ToolCall.Function(
                             function.path("name").asText(),
-                            function.path("arguments").asText("{}"))));
+                            arguments.textValue())));
         }
         return List.copyOf(calls);
     }

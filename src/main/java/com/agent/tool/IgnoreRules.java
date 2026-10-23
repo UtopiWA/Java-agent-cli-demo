@@ -3,13 +3,15 @@ package com.agent.tool;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /** 读取并匹配项目根目录中的 .agentignore 规则。 */
-final class IgnoreRules {
+public final class IgnoreRules {
     private static final String CONFIG_FILE = ".agentignore";
 
     private final List<Rule> rules;
@@ -21,14 +23,19 @@ final class IgnoreRules {
     /**
      * 加载项目级忽略配置；配置不存在时使用空规则。
      */
-    static IgnoreRules load(Path root) throws IOException {
+    public static IgnoreRules load(Path root) throws IOException {
         Path config = root.resolve(CONFIG_FILE);
-        if (!Files.isRegularFile(config)) {
+        if (!Files.isRegularFile(config, LinkOption.NOFOLLOW_LINKS)) {
             return new IgnoreRules(List.of());
         }
 
         List<Rule> rules = new ArrayList<>();
-        for (String line : Files.readAllLines(config, StandardCharsets.UTF_8)) {
+        List<String> lines = Files.readAllLines(config, StandardCharsets.UTF_8);
+        for (int index = 0; index < lines.size(); index++) {
+            String line = lines.get(index);
+            if (index == 0 && line.startsWith("\uFEFF")) {
+                line = line.substring(1);
+            }
             String value = line.trim();
             if (!value.isEmpty() && !value.startsWith("#")) {
                 rules.add(Rule.parse(value));
@@ -38,9 +45,35 @@ final class IgnoreRules {
     }
 
     /** 判断给定路径或其任一父目录是否命中忽略规则。 */
-    boolean isIgnored(Path root, Path path, boolean directory) {
+    public boolean isIgnored(Path root, Path path, boolean directory) {
         String relative = normalize(root.relativize(path));
         return rules.stream().anyMatch(rule -> rule.matches(relative, directory));
+    }
+
+    /** 同时应用项目级忽略配置和工具不可访问的固定目录。 */
+    public boolean isExcluded(Path projectRoot, Path path, boolean directory) {
+        return isAlwaysExcluded(projectRoot, path) || isIgnored(projectRoot, path, directory);
+    }
+
+    /** 敏感配置、内部状态和构建产物不进入模型上下文。 */
+    public static boolean isAlwaysExcluded(Path projectRoot, Path path) {
+        Path normalizedRoot = projectRoot.toAbsolutePath().normalize();
+        Path normalizedPath = path.toAbsolutePath().normalize();
+        if (!normalizedPath.startsWith(normalizedRoot)) {
+            return true;
+        }
+
+        for (Path part : normalizedRoot.relativize(normalizedPath)) {
+            String name = part.toString().toLowerCase(Locale.ROOT);
+            if (name.equals(".git") || name.equals(".agent") || name.equals("target")
+                    || name.equals(".env") || name.startsWith(".env.")
+                    || name.equals("credentials") || name.equals("credentials.json")
+                    || name.equals("id_rsa") || name.endsWith(".pem")
+                    || name.endsWith(".p12") || name.endsWith(".jks")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String normalize(Path path) {

@@ -11,6 +11,7 @@ import okhttp3.ResponseBody;
 import okio.Buffer;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -61,8 +62,39 @@ class GlmClientTest {
         assertEquals("", response.content());
         assertEquals("call_1", response.toolCalls().get(0).id());
         assertEquals("read_file", response.toolCalls().get(0).name());
+        assertEquals("{\"path\":\"pom.xml\"}", response.toolCalls().get(0).arguments());
         assertEquals(18, response.promptTokens());
         assertEquals(7, response.completionTokens());
+    }
+
+    @Test
+    void shouldRejectNonStringToolArgumentsInsteadOfSilentlyReplacingThem() throws Exception {
+        String responseJson = """
+                {
+                  "choices": [{
+                    "message": {
+                      "content": null,
+                      "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                          "name": "write_file",
+                          "arguments": {"content": ""}
+                        }
+                      }]
+                    }
+                  }]
+                }
+                """;
+        GlmClient client = new GlmClient(
+                "test-key", fakeHttpClient(200, responseJson, new AtomicReference<>(),
+                        new AtomicReference<>()),
+                "https://example.invalid/chat", mapper);
+
+        IOException error = assertThrows(IOException.class,
+                () -> client.chat(List.of(Message.user("生成测试")), List.of()));
+
+        assertTrue(error.getMessage().contains("arguments 必须是 JSON 字符串"));
     }
 
     @Test
@@ -107,6 +139,27 @@ class GlmClientTest {
         assertEquals(1024, request.path("max_tokens").asInt());
         assertEquals(false, request.path("stream").asBoolean());
         assertEquals("会话标题", response.content());
+    }
+
+    @Test
+    void shouldUseLowReasoningAndSmallOutputBudgetForIntent() throws Exception {
+        AtomicReference<String> capturedBody = new AtomicReference<>();
+        OkHttpClient httpClient = fakeHttpClient(
+                200,
+                "{\"choices\":[{\"message\":{\"content\":\"ANALYSIS\"}}]}",
+                new AtomicReference<>(),
+                capturedBody);
+        GlmClient client = new GlmClient(
+                "test-key", httpClient, "https://example.invalid/chat", mapper);
+
+        LLMResponse response = client.chatForIntent(List.of(Message.user("只分析")));
+
+        JsonNode request = mapper.readTree(capturedBody.get());
+        assertEquals("low", request.path("reasoning_effort").asText());
+        assertEquals(32, request.path("max_tokens").asInt());
+        assertEquals(false, request.path("stream").asBoolean());
+        assertTrue(request.path("tools").isMissingNode());
+        assertEquals("ANALYSIS", response.content());
     }
 
     @Test

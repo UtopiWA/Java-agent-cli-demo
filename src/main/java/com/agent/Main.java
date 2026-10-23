@@ -15,6 +15,9 @@ import com.agent.history.HistorySanitizer;
 import com.agent.history.SessionManager;
 import com.agent.history.TitleGenerator;
 import com.agent.llm.GlmClient;
+import com.agent.llm.LLMClient;
+import com.agent.task.ProjectLock;
+import com.agent.task.TaskManager;
 import com.agent.tool.ToolRegistry;
 
 /** 应用入口：无参数时启动 Lab03 Agent CLI，--upper 保留 Lab01 演示模式。 */
@@ -29,24 +32,13 @@ public class Main {
             return;
         }
 
-        String apiKey = loadApiKey(Path.of(".env"), System.getenv());
-        if (apiKey == null || apiKey.isBlank()) {
-            System.err.println("错误：未找到 GLM_API_KEY");
-            System.err.println("请在 .env 或环境变量中设置 GLM_API_KEY");
-            return;
+        Path projectRoot = Path.of(".").toAbsolutePath().normalize();
+        String apiKey = loadApiKey(projectRoot.resolve(".env"), System.getenv());
+        LLMClient client = apiKey == null || apiKey.isBlank() ? null : new GlmClient(apiKey);
+        try (ProjectLock lock = ProjectLock.tryAcquire(projectRoot)) {
+            new TestAgentCli(new TaskManager(projectRoot), client, writer, lock)
+                    .run(reader);
         }
-
-        GlmClient client = new GlmClient(apiKey);
-        HistorySanitizer sanitizer = new HistorySanitizer();
-        HistoryContextBuilder contextBuilder = new HistoryContextBuilder();
-        Agent agent = new Agent(client, new ToolRegistry(), contextBuilder);
-        SessionManager sessions = new SessionManager(
-                agent,
-                new ChatHistoryStore(Path.of(".")),
-                sanitizer,
-                contextBuilder,
-                new TitleGenerator(client, sanitizer));
-        runAgentCli(reader, writer, sessions);
     }
 
     /** 保留 Lab01 的逐行输入模式，供原有测试与 --upper 参数继续使用。 */

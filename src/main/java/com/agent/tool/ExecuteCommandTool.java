@@ -59,6 +59,42 @@ public final class ExecuteCommandTool {
             throw new IllegalArgumentException("timeout 必须在 1 毫秒到 120 秒之间");
         }
 
+        return executeProcess(workingDirectory, program, arguments, timeout);
+    }
+
+    /** 由任务状态机调用的固定 Maven 测试入口，模型不能提供任何 Maven 参数。 */
+    public CommandResult executeMavenTests(
+            Path workingDirectory,
+            String qualifiedTestClass,
+            boolean targetOnly,
+            Duration timeout) throws IOException, InterruptedException {
+        validateWorkingDirectory(workingDirectory);
+        if (targetOnly && (qualifiedTestClass == null || !qualifiedTestClass.matches(
+                "[\\p{javaJavaIdentifierStart}][\\p{javaJavaIdentifierPart}]*"
+                        + "(?:\\.[\\p{javaJavaIdentifierStart}][\\p{javaJavaIdentifierPart}]*)*"))) {
+            throw new IllegalArgumentException("定向测试类名无效");
+        }
+        if (timeout == null || timeout.isZero() || timeout.isNegative()
+                || timeout.compareTo(MAX_TIMEOUT) > 0) {
+            throw new IllegalArgumentException("timeout 必须在 1 毫秒到 120 秒之间");
+        }
+        List<String> arguments = new ArrayList<>();
+        arguments.add("-q");
+        if (targetOnly) {
+            arguments.add("-Dtest=" + qualifiedTestClass);
+        }
+        arguments.add("test");
+        String program = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")
+                ? "mvn.cmd" : "mvn";
+        return executeProcess(workingDirectory, program, arguments, timeout);
+    }
+
+    private CommandResult executeProcess(
+            Path workingDirectory,
+            String program,
+            List<String> arguments,
+            Duration timeout) throws IOException, InterruptedException {
+
         List<String> command = buildCommand(program, arguments);
         ProcessBuilder processBuilder = new ProcessBuilder(command)
                 .directory(workingDirectory.toFile());
@@ -75,11 +111,7 @@ public final class ExecuteCommandTool {
         try {
             completed = process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS);
             if (!completed) {
-                process.destroy();
-                if (!process.waitFor(500, TimeUnit.MILLISECONDS)) {
-                    process.destroyForcibly();
-                    process.waitFor();
-                }
+                terminateProcessTree(process);
             }
             return new CommandResult(
                     completed ? process.exitValue() : -1,
@@ -88,10 +120,23 @@ public final class ExecuteCommandTool {
                     awaitOutput(stderr));
         } finally {
             if (process.isAlive()) {
-                process.destroyForcibly();
+                terminateProcessTree(process);
             }
             readers.shutdownNow();
         }
+    }
+
+    /** 先正常结束后代和主进程，短暂等待后再强制清理残留进程。 */
+    private static void terminateProcessTree(Process process) throws InterruptedException {
+        List<ProcessHandle> descendants = process.descendants().toList();
+        descendants.forEach(ProcessHandle::destroy);
+        process.destroy();
+        if (!process.waitFor(500, TimeUnit.MILLISECONDS)) {
+            descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly();
+            process.waitFor();
+        }
+        descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
     }
 
     private static void validateWorkingDirectory(Path directory) {

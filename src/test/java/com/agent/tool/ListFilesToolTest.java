@@ -73,4 +73,26 @@ class ListFilesToolTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new ListFilesTool().listFiles(root, -1));
     }
+
+    @Test
+    void shouldPageTreeWithProjectLevelIgnoreRules(@TempDir Path root) throws Exception {
+        Files.writeString(root.resolve(".agentignore"), "ignored/\n");
+        Files.createDirectories(root.resolve("src/ignored"));
+        Files.writeString(root.resolve("src/A.java"), "class A {}");
+        Files.writeString(root.resolve("src/B.java"), "class B {}");
+        Files.writeString(root.resolve("src/ignored/Hidden.java"), "class Hidden {}");
+
+        ListFilesTool tool = new ListFilesTool();
+        ListFilesTool.TreePage first = tool.treePage(root, root.resolve("src"), 2, 0, 1);
+        ListFilesTool.TreePage second = tool.treePage(
+                root, root.resolve("src"), 2, first.nextOffset(), 1);
+
+        assertEquals(1, first.returnedEntries());
+        assertTrue(first.hasMore());
+        assertEquals(1, first.nextOffset());
+        assertTrue(first.tree().contains("A.java"));
+        assertTrue(second.tree().contains("B.java"));
+        assertFalse(first.tree().contains("Hidden.java"));
+        assertFalse(second.hasMore());
+    }
 }
